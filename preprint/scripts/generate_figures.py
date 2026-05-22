@@ -275,17 +275,26 @@ def fig5_scaling_curve():
             rows.append((int(r["N"]), r["mode"], float(r["wall_s"]),
                          float(r["peak_rss_mb"])))
 
-    modes = ["sketch-1600-mask", "sketch-200", "sketch-1000",
-             "exact-f32", "exact-f64"]
-    labels = {"sketch-1600-mask": "sketch-1600 + mask (truth cluster)",
-              "sketch-200": "sketch-200",
-              "sketch-1000": "sketch-1000",
+    # Truth-cluster series: --sketch 1000 --snp-level-masking (the recommended
+    # mode). scaling_bench.csv predates the d=1000 standardization, so pull the
+    # d=1000+mask wall/RSS points from the N×d sweep instead.
+    dn_path = Path(__file__).parent.parent / "data" / "dn_sweep_full.csv"
+    if dn_path.exists():
+        with open(dn_path) as f:
+            for r in csv.DictReader(f):
+                if r["mode"] == "sk1000-mask":
+                    rows.append((int(r["N"]), "sketch-1000-mask",
+                                 float(r["wall_s"]), float(r["peak_rss_mb"])))
+
+    modes = ["sketch-1000-mask", "sketch-200", "exact-f32", "exact-f64"]
+    labels = {"sketch-1000-mask": "sketch-1000 + mask (truth cluster)",
+              "sketch-200": "sketch-200 (biased)",
               "exact-f32": "exact-f32", "exact-f64": "exact-f64"}
-    colors = {"sketch-1600-mask": "#d62728",
-              "sketch-200": "#aec7e8", "sketch-1000": "#9edae5",
+    colors = {"sketch-1000-mask": "#d62728",
+              "sketch-200": "#aec7e8",
               "exact-f32": "#98df8a", "exact-f64": "#2ca02c"}
-    markers = {"sketch-1600-mask": "D",
-               "sketch-200": "o", "sketch-1000": "s",
+    markers = {"sketch-1000-mask": "D",
+               "sketch-200": "o",
                "exact-f32": "^", "exact-f64": "v"}
 
     fig, (ax_t, ax_m) = plt.subplots(1, 2, figsize=(7.2, 3.4))
@@ -676,6 +685,59 @@ def fig4_sketch_accuracy():
     print("  fig4_sketch_accuracy.png")
 
 
+def fig8_sketch_h2_sim():
+    """Controlled-truth recovery: sketched ĥ² → exact → true h² as d→N, on the
+    real 1000G EUR panel (N=503) where exact LD scores recover the truth."""
+    import csv
+    from collections import defaultdict
+    csv_path = Path(__file__).parent.parent / "data" / "h2_simulation_sketch_sweep_1000g.csv"
+    if not csv_path.exists():
+        print("  SKIP fig8: missing h2_simulation_sketch_sweep_1000g.csv")
+        return
+    # group h2_est by (h2_true, d)
+    cells = defaultdict(list)
+    for r in csv.DictReader(open(csv_path)):
+        cells[(float(r["h2_true"]), int(r["d"]))].append(float(r["h2_est"]))
+
+    h2_levels = sorted({k[0] for k in cells})
+    colors = {0.2: "#1f77b4", 0.5: "#d62728"}
+
+    fig, ax = plt.subplots(figsize=(5.0, 3.6))
+    for h2t in h2_levels:
+        ds = sorted({d for (h, d) in cells if h == h2t and d > 0})
+        means = [np.mean(cells[(h2t, d)]) for d in ds]
+        ses = [np.std(cells[(h2t, d)], ddof=1) / np.sqrt(len(cells[(h2t, d)])) for d in ds]
+        c = colors.get(h2t, "gray")
+        ax.errorbar(ds, means, yerr=ses, marker="o", markersize=5, capsize=2.5,
+                    linewidth=1.2, color=c, label=f"sketch, true $h^2$={h2t}")
+        # exact-masked baseline (d=0) as a horizontal solid line
+        exact = cells[(h2t, 0)]
+        ax.axhline(np.mean(exact), color=c, linestyle="-", linewidth=0.9, alpha=0.55)
+        # true h² as a horizontal dashed line
+        ax.axhline(h2t, color=c, linestyle="--", linewidth=0.9, alpha=0.8)
+
+    ax.set_xscale("log")
+    ax.set_xlabel("Sketch dimension d  (N = 503, so d ≤ 503)")
+    ax.set_ylabel(r"Recovered $\hat{h}^2$ (50 replicates)")
+    ax.set_title("Sketched $\\hat{h}^2$ recovery vs known truth (1000G EUR, chr22)",
+                 fontsize=8.5)
+    # Legend entries for the reference lines
+    from matplotlib.lines import Line2D
+    handles, lbls = ax.get_legend_handles_labels()
+    handles += [Line2D([0], [0], color="gray", linestyle="-", lw=0.9),
+                Line2D([0], [0], color="gray", linestyle="--", lw=0.9)]
+    lbls += ["exact-masked ĥ² (N=503)", "true $h^2$"]
+    ax.legend(handles, lbls, fontsize=6.8, loc="center right", framealpha=0.9)
+    ax.grid(True, which="major", alpha=0.3, linewidth=0.4)
+    ax.grid(True, which="minor", alpha=0.12, linewidth=0.3)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    fig.tight_layout()
+    fig.savefig(FIGDIR / "fig8_sketch_h2_sim.png", dpi=300, bbox_inches="tight")
+    plt.close()
+    print("  fig8_sketch_h2_sim.png")
+
+
 if __name__ == "__main__":
     print("Generating figures...")
     fig0_architecture()
@@ -685,6 +747,7 @@ if __name__ == "__main__":
     fig5_scaling_curve()
     fig6_maf_facet()
     fig7_optimal_d()
+    fig8_sketch_h2_sim()
 
     # Fig 3 needs Python + Rust exact + sketch LD score files
     python_path = Path("/tmp/py_ld.l2.ldscore.gz")

@@ -54,6 +54,20 @@ H2_TRUE_VALUES = [0.2, 0.5]
 N_REPLICATES = 50
 H2_RECOVERY_TOL_SE = 2.0   # mean(h2_masked) within this many SE of h2_true
 
+# --- sketch-sweep subcommand (controlled-truth test of sketched ĥ² bias) -----
+# CountSketch requires d <= N, so the recommended d>=1000 regime can only be
+# exercised on the N=50,000 synthetic biobank, not the N=503 1000G_eur panel.
+# We restrict to chr22 (BIM is byte-identical to 1000G, so the SNP set matches
+# the N=503 runs) to keep per-run cost low. GWAS Z-scores are computed directly
+# as the marginal no-covariate statistic Z = Gᵀy/√N (textbook association test),
+# eliminating the external plink2 dependency the chunked/masked path uses.
+BIOBANK_BFILE = ROOT / "data" / "biobank_50k"   # N=50,000 synthetic (see §Limitations)
+SKETCH_DIMS = [200, 500, 1000, 2000, 5000]
+SKETCH_LDSCORE_DIR = OUT_DIR / "sim_ldscores_sketch"
+SKETCH_SUMSTATS_DIR = OUT_DIR / "sim_sumstats_sketch"
+SKETCH_SWEEP_CSV = OUT_DIR / "h2_simulation_sketch_sweep.csv"
+SKETCH_SNPLIST = OUT_DIR / "chr22_biobank_maf05.snplist"
+
 # h2 stdout regexes (format strings live in src/regressions.rs:745,747,749,751)
 RE_H2 = re.compile(r"Total Observed scale h2: ([-0-9.]+) \(([-0-9.]+)\)")
 RE_INTERCEPT_FREE = re.compile(r"Intercept: ([-0-9.]+) \(([-0-9.]+)\)")
@@ -678,6 +692,194 @@ def cmd_aggregate(args) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Subcommand: sketch-sweep — controlled-truth test of sketched ĥ² bias
+# ---------------------------------------------------------------------------
+
+def write_marginal_sumstats_tsv(
+    z: np.ndarray,
+    snp_ids: list[str],
+    a1s: list[str],
+    a2s: list[str],
+    n: int,
+    tsv_path: Path,
+) -> None:
+    """Write a munge-sumstats input TSV (SNP A1 A2 N BETA P) from marginal Z.
+
+    BETA carries only the sign (munge derives |Z| from P via erfc_inv); P is the
+    two-sided normal tail P(|Z| > |z|) = erfc(|z|/√2).
+    """
+    inv_sqrt2 = 1.0 / math.sqrt(2.0)
+    with open(tsv_path, "w") as f:
+        f.write("SNP\tA1\tA2\tN\tBETA\tP\n")
+        for sid, a1, a2, zi in zip(snp_ids, a1s, a2s, z):
+            zi = float(zi)
+            p = math.erfc(abs(zi) * inv_sqrt2)
+            if p <= 0.0:
+                p = 1e-300
+            f.write(f"{sid}\t{a1}\t{a2}\t{n}\t{zi:.6f}\t{p:.6e}\n")
+
+
+def cmd_sketch_sweep(args) -> None:
+    """Does CountSketch bias the heritability estimate under a known generative
+    model? Computes LD scores exactly (per-SNP masked) and with --sketch d for
+    several d, all under --snp-level-masking, on chr22 of a chosen panel;
+    recovers ĥ² from simulated phenotypes with known h²; reports
+    bias(ĥ²_sketch) vs truth and vs the exact-masked baseline.
+
+    Two panels are intended:
+      --bfile data/1000G_eur  --dims 50,100,200,350,500 --tag 1000g
+          real LD, N=503: exact recovers the true h² (small finite-sample
+          bias), so this measures sketch bias against a *trustworthy* truth.
+          d is capped at N=503.
+      --bfile data/biobank_50k --dims 200,500,1000,2000,5000 --tag biobank
+          synthetic N=50,000 (rank ≤ 2,490; see §Limitations): exact does NOT
+          recover truth here, so only the sketch-vs-exact comparison is
+          meaningful, but it extends to the recommended d≥1000 regime.
+    """
+    bfile = Path(args.bfile) if getattr(args, "bfile", None) else BIOBANK_BFILE
+    dims = ([int(x) for x in args.dims.split(",")] if getattr(args, "dims", None)
+            else SKETCH_DIMS)
+    tag = getattr(args, "tag", None) or "biobank"
+    out_csv = OUT_DIR / f"h2_simulation_sketch_sweep_{tag}.csv"
+
+    if not LDSC_BIN.exists():
+        sys.exit(f"Missing {LDSC_BIN}. Run: cargo build --release")
+    if not (bfile.with_suffix(".bed")).exists():
+        sys.exit(f"Missing {bfile}.bed.")
+
+    SKETCH_LDSCORE_DIR.mkdir(parents=True, exist_ok=True)
+    SKETCH_SUMSTATS_DIR.mkdir(parents=True, exist_ok=True)
+
+    # 1. Decode chr22 of the panel, MAF filter, standardize. G is (N, M).
+    print(f"[sketch:{tag}] Loading + standardizing chr22 of {bfile} ...")
+    t0 = time.time()
+    bim = read_bim(bfile)
+    n_indiv = count_fam(bfile)
+    chr22_idx = select_chr_snp_indices(bim, CHR_TARGET)
+    kept_idx, G = load_bed_subset_standardized(bfile, chr22_idx, n_indiv, MAF_MIN)
+    snp_ids = [bim[i][1] for i in kept_idx]
+    a1s = [bim[i][4] for i in kept_idx]
+    a2s = [bim[i][5] for i in kept_idx]
+    n, m = G.shape
+    print(f"[sketch:{tag}]   G.shape=({n}, {m})  RAM={G.nbytes/1e9:.1f} GB  ({time.time()-t0:.1f}s)")
+    dims = [d for d in dims if d <= n]   # --sketch requires d <= N
+    print(f"[sketch:{tag}]   sketch dims (after d<=N filter): {dims}")
+
+    snplist = OUT_DIR / f"chr22_{tag}_maf05.snplist"
+    snplist.write_text("\n".join(snp_ids) + "\n")
+    SKETCH_SNPLIST = snplist  # noqa: local rebind for the rest of this function
+
+    # 2. LD score references: exact-masked baseline + one per sketch dimension.
+    print("[sketch] Computing LD score references (exact-masked + sketch d) ...")
+    refs: dict[str, Path] = {}
+    base_cli = [
+        "l2", "--bfile", str(bfile), "--extract", str(SKETCH_SNPLIST),
+        "--ld-wind-kb", str(LD_WIND_KB), "--maf", str(MAF_MIN), "--yes-really",
+    ]
+    em = SKETCH_LDSCORE_DIR / f"{tag}_exact_masked"
+    t0 = time.time()
+    run_ldsc(base_cli + ["--snp-level-masking", "--out", str(em)])
+    refs["exact_masked"] = em
+    print(f"[sketch:{tag}]   exact_masked done ({time.time()-t0:.1f}s)")
+    for d in dims:
+        rf = SKETCH_LDSCORE_DIR / f"{tag}_sketch_{d}_masked"
+        t0 = time.time()
+        run_ldsc(base_cli + ["--sketch", str(d), "--snp-level-masking", "--out", str(rf)])
+        refs[f"sketch_{d}"] = rf
+        print(f"[sketch]   sketch_{d} done ({time.time()-t0:.1f}s)")
+    M_total = read_M_5_50(refs["exact_masked"])
+
+    # 3. Simulate all phenotypes (batched), compute batched marginal Z = Gᵀy/√N,
+    #    write per-pheno munge-input TSVs, munge → .sumstats.gz.
+    print(f"[sketch] Simulating {len(H2_TRUE_VALUES)*N_REPLICATES} phenotypes + marginal GWAS ...")
+    t0 = time.time()
+    pheno_meta: list[tuple[int, float, str]] = []
+    pheno_cols: list[np.ndarray] = []
+    for h2_true in H2_TRUE_VALUES:
+        for rep in range(N_REPLICATES):
+            seed = 1000 * int(round(h2_true * 100)) + rep
+            pheno_cols.append(simulate_phenotype(G, h2_true, seed=seed))
+            pheno_meta.append((rep, h2_true, f"sk_{tag}_h2_{int(round(h2_true*100)):03d}_rep{rep:03d}"))
+    Y = np.stack(pheno_cols, axis=1).astype(np.float32)   # (N, P)
+    del pheno_cols
+    Yc = Y - Y.mean(axis=0, keepdims=True)
+    Yc /= np.where(Yc.std(axis=0, keepdims=True) > 0, Yc.std(axis=0, keepdims=True), 1.0)
+    Z = (G.T @ Yc) / math.sqrt(n)                          # (M, P) marginal Z per SNP
+    print(f"[sketch]   GWAS Z matrix {Z.shape} in {time.time()-t0:.1f}s; munging ...")
+    t0 = time.time()
+    sumstats_paths: dict[str, str] = {}
+    for j, (rep, h2_true, name) in enumerate(pheno_meta):
+        tsv = SKETCH_SUMSTATS_DIR / f"{name}.tsv"
+        write_marginal_sumstats_tsv(Z[:, j], snp_ids, a1s, a2s, n, tsv)
+        run_ldsc_munge(tsv, n, SKETCH_SUMSTATS_DIR / name)
+        sumstats_paths[name] = f"{SKETCH_SUMSTATS_DIR / name}.sumstats.gz"
+    print(f"[sketch]   munge complete in {time.time()-t0:.0f}s")
+
+    # 4. h² regression for every (phenotype × LD-score reference).
+    rows = []
+    n_runs = len(pheno_meta) * len(refs)
+    print(f"[sketch] Running {n_runs} h² regressions ...")
+    t0 = time.time()
+    for i, (rep, h2_true, name) in enumerate(pheno_meta):
+        for mode_label, ref in refs.items():
+            d = 0 if mode_label == "exact_masked" else int(mode_label.split("_")[1])
+            stdout = run_ldsc([
+                "h2", "--h2", sumstats_paths[name],
+                "--ref-ld", str(ref) + ".l2.ldscore.gz",
+                "--w-ld", str(ref) + ".l2.ldscore.gz",
+                "--M", str(M_total),
+                "--out", str(SKETCH_SUMSTATS_DIR / f".tmp_{mode_label}_{name}"),
+            ])
+            parsed = parse_h2_stdout(stdout)
+            if parsed is None:
+                sys.exit(f"[FAIL] could not parse h² stdout for {name} {mode_label}\n{stdout}")
+            rows.append({
+                "rep": rep, "h2_true": h2_true, "mode": mode_label, "d": d,
+                "h2_est": parsed["h2"], "h2_se": parsed["h2_se"],
+                "intercept": parsed.get("intercept", float("nan")),
+                "mean_chi2": parsed.get("mean_chi2", float("nan")),
+            })
+        if (i + 1) % 20 == 0:
+            print(f"[sketch]   {(i+1)*len(refs)}/{n_runs} runs ({time.time()-t0:.0f}s)")
+    print(f"[sketch]   {n_runs} h² runs done in {time.time()-t0:.0f}s")
+
+    # 5. Write CSV.
+    with open(out_csv, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"[sketch:{tag}] Wrote {out_csv} ({len(rows)} rows)")
+    for f in SKETCH_SUMSTATS_DIR.glob(".tmp_*"):
+        f.unlink()
+
+    _sketch_aggregate(rows)
+
+
+def _sketch_aggregate(rows: list[dict]) -> None:
+    """Print bias of ĥ²_sketch vs truth and vs the exact-masked baseline."""
+    print("\n=== Sketch ĥ² bias (mean over replicates) ===\n")
+    print("| true h² |   d   | ĥ² (SE over reps)   | bias vs truth | bias vs exact-masked |")
+    print("|---------|-------|---------------------|---------------|----------------------|")
+    h2_levels = sorted(set(r["h2_true"] for r in rows))
+    d_levels = sorted(set(r["d"] for r in rows))   # 0 (exact) first
+    for h2_true in h2_levels:
+        exact = np.array([r["h2_est"] for r in rows
+                          if r["h2_true"] == h2_true and r["d"] == 0])
+        mean_exact = float(exact.mean())
+        for d in d_levels:
+            ests = np.array([r["h2_est"] for r in rows
+                             if r["h2_true"] == h2_true and r["d"] == d])
+            if len(ests) == 0:
+                continue
+            mean = float(ests.mean())
+            se = float(ests.std(ddof=1) / math.sqrt(len(ests)))
+            label = "exact" if d == 0 else f"{d}"
+            print(f"| {h2_true:.2f}   | {label:>5} | {mean:.4f} ± {se:.4f}    "
+                  f"| {mean - h2_true:+.4f}      | {mean - mean_exact:+.4f}            |")
+    print()
+
+
+# ---------------------------------------------------------------------------
 # Entrypoint
 # ---------------------------------------------------------------------------
 
@@ -689,6 +891,11 @@ def main() -> None:
     sub.add_parser("simulate", help="generate sumstats + run h² regressions")
     sub.add_parser("aggregate", help="parse CSV + print results table")
     sub.add_parser("all", help="run prep, simulate, aggregate end-to-end")
+    ss = sub.add_parser("sketch-sweep", help="controlled-truth test of sketched ĥ² bias")
+    ss.add_argument("--bfile", default=str(BIOBANK_BFILE), help="PLINK prefix (default: biobank_50k)")
+    ss.add_argument("--dims", default=",".join(str(d) for d in SKETCH_DIMS),
+                    help="comma-separated sketch dimensions (filtered to d<=N)")
+    ss.add_argument("--tag", default="biobank", help="output tag (CSV suffix + ref prefix)")
     args = p.parse_args()
 
     if args.cmd == "all":
@@ -701,6 +908,8 @@ def main() -> None:
         cmd_simulate(args)
     elif args.cmd == "aggregate":
         cmd_aggregate(args)
+    elif args.cmd == "sketch-sweep":
+        cmd_sketch_sweep(args)
 
 
 if __name__ == "__main__":

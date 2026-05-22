@@ -255,9 +255,18 @@ is data-dependent: on the 1000 Genomes panel ($N = 2{,}490$), fitting the
 same model yields $d^* approx 35$, reflecting the much smaller per-chunk
 scatter-add cost at lower $N$.
 
-At $d = 2000$ (near $d^*$), ldsc-rs achieves $r = 0.995$ correlation with
-exact LD scores at 30#sym.times the speed of exact f64---the optimal
-operating point for biobank-scale data.
+The recommended operating point is $d = 1000$, which keeps $hat(h)^2$ within
+$0.003$ of per-SNP exact (Supplementary Table S3) at $approx 33$#sym.times the
+speed of exact f64; because $d = 1000 << d^*$, this accuracy is essentially
+free of GEMM cost. Pushing to $d = 2000$ buys $r = 0.995$ at little extra wall
+(still below $d^*$), useful when per-SNP LD scores feed partitioned analyses;
+$d >= 5000$ reaches $r >= 0.999$ for fine-mapping-grade accuracy.
+
+@fig:scaling traces wall-clock time and peak memory for the recommended mode
+and the two exact modes across $N in {503, 10"K", 20"K", 50"K", 100"K"}$;
+the per-$N$ measurements are tabulated in Supplementary Table S1. The
+truth-cluster sketch is nearly flat in $N$ (15 s at $N = 100{,}000$) while
+exact f32 grows to 17 minutes, a $tilde$70#sym.times advantage.
 
 #figure(
   image("figures/fig5_scaling_curve.png", width: 100%),
@@ -267,9 +276,9 @@ operating point for biobank-scale data.
     laptop: 1000 Genomes EUR ($N = 503$), and synthetic biobank panels
     at $N in {10K, 20K, 50K, 100K}$ (21#sym.times#h(0pt)-replication
     of 1000G EUR with 1% per-genotype noise). Log-log axes. The red
-    diamonds mark the *h² truth-cluster* mode (`--sketch 1600
+    diamonds mark the recommended *h² truth-cluster* mode (`--sketch 1000
     --snp-level-masking`), which recovers per-SNP exact $hat(h)^2$
-    within $0.001$ on real GWAS. Exact modes (green) scale approximately
+    within $0.003$ on real GWAS. Exact modes (green) scale approximately
     linearly in $N$ — exact f32 takes 17 minutes at $N = 100,000$ and
     uses 14 GB peak RSS. Both the truth-cluster sketch and the smaller
     (biased) sketch dimensions are nearly flat in $N$ across this
@@ -282,49 +291,6 @@ operating point for biobank-scale data.
   ],
 ) <fig:scaling>
 
-#figure(
-  table(
-    columns: 7,
-    align: (left, right, right, right, right, right, right),
-    table.header(
-      [*$N$*],
-      [*sketch-1600 + mask*\ *(h² truth cluster)*],
-      [*sketch-1600 + mask*\ *peak RSS (MB)*],
-      [*exact f32 wall (s)*],
-      [*exact f32 RSS (MB)*],
-      [*exact f64 wall (s)*],
-      [*exact f64 RSS (MB)*],
-    ),
-    table.hline(stroke: 0.5pt),
-    [503], [---#super("a")], [---], [9.4], [634], [15.5], [714],
-    [10K], [6.6 s], [1,356], [93 s], [4,449], [243 s], [4,190],
-    [20K], [7.9 s], [1,685], [133 s], [7,630], [482 s], [5,716],
-    [50K], [11.6 s], [2,432], [292 s], [13,752], [---#super("b")], [---],
-    [100K], [15.0 s], [4,399], [1{,}013 s], [14,609], [---#super("b")], [---],
-  ),
-  caption: [
-    Time and memory scaling across $N$ on a single Apple M5 Pro laptop
-    (M5 Pro, 18 cores, 36 GB RAM, macOS 15). Wall time and peak RSS
-    for the *h² truth-cluster sketch mode* (`--sketch 1600
-    --snp-level-masking`), which recovers per-SNP exact heritability
-    estimates within 0.001 across BMI and Height GWAS, against the
-    two exact modes. At $N = 100{,}000$ the truth-cluster sketch
-    delivers a $tilde$68#sym.times speedup over exact f32 (15 s
-    vs.\ 1,013 s) and a $tilde$3#sym.times memory advantage (4.4 GB
-    vs.\ 14.6 GB). At smaller $N$ the truth-cluster sketch is
-    essentially indistinguishable in wall time from cheaper but
-    biased sketch dimensions (e.g.\ `--sketch 200` finishes in
-    13 s at $N = 100,000$ but gives h² off the truth cluster by
-    ${tilde}0.013$ on real GWAS), so there is no speed reason to
-    prefer a low $d$ over the recommended truth-cluster $d = 1600$.
-    (#super("a")) `--sketch 1600` requires $d lt.eq N$ and is not
-    applicable at $N = 503$ --- at 1000 Genomes scale, exact f32
-    is the recommended mode. (#super("b")) Exact f64 at
-    $N gt.eq 50,000$ takes multi-hour walls locally; the AWS EPYC
-    7R13 figure of 727 s at $N = 50,000$ is reported in
-    @tbl:perf-biobank.
-  ],
-) <tbl:scaling>
 
 #figure(
   image("figures/fig2_biobank_scaling.png", width: 100%),
@@ -363,36 +329,10 @@ of the pairwise $r^2$ signal. Once $d$ is large enough to capture these
 dominant components faithfully, further increases yield diminishing returns
 as only weak-LD pairs (contributing negligibly to the LD score sum) benefit.
 
-@tbl:optimal-d shows measured accuracy and predicted runtime for several
+Supplementary Table S2 shows measured accuracy and predicted runtime for several
 sketch dimensions. The cost model enables users to estimate the runtime for
 any $d$; the accuracy values are measured directly on the biobank dataset.
 
-#figure(
-  table(
-    columns: 5,
-    align: (left, right, right, right, right),
-    table.header(
-      [*$d$*], [*Measured $r$*], [*1000G time (s)*], [*Biobank time (s)*], [*Biobank speedup*],
-    ),
-    table.hline(stroke: 0.5pt),
-    [50], [0.842], [3.6#super("†")], [16], [41#sym.times],
-    [200], [0.960], [5.0#super("†")], [16], [41#sym.times],
-    [500], [0.981], [7.9#super("†")], [18], [36#sym.times],
-    [1000], [0.990], [10.5#super("†")], [20], [33#sym.times],
-    [2000], [0.994], [28.3#super("†")], [22], [30#sym.times],
-    [5000], [0.996], [---], [36], [18#sym.times],
-    [10000], [0.997], [---], [59], [11#sym.times],
-  ),
-  caption: [
-    CountSketch accuracy and runtime vs.\ sketch dimension. Accuracy ($r$):
-    Pearson correlation with exact f64 LD scores, measured on the synthetic
-    biobank dataset ($N = 50{,}000$, 1.66M SNPs; see §Limitations). Times from
-    the cost model $T(d) = T_"scatter" + T_"GEMM" dot d$ except where directly
-    measured.
-    #super("†")1000G local benchmarks (Ryzen 5 5600X).
-    #super("‡")Predicted by cost model. Biobank speedup vs.\ exact f64 (727 s).
-  ],
-) <tbl:optimal-d>
 
 #figure(
   image("figures/fig4_sketch_accuracy.png", width: 100%),
@@ -448,36 +388,6 @@ $plus.minus 0.001$ band).
 The empirical recommendation that emerges is essentially $N$-independent
 within the studied range:
 
-#figure(
-  table(
-    columns: 5,
-    align: (right, left, right, right, right),
-    table.header(
-      [*$N$*], [*Recommended $d$*], [*Wall (s)*],
-      [*Pearson $r$*], [*$|hat(h)^2_("sketch") - hat(h)^2_("exact")|$*],
-    ),
-    table.hline(stroke: 0.5pt),
-    [503], [500], [3.0], [0.994], [0.006],
-    [10K], [1{,}000], [7.4], [0.994], [0.003],
-    [20K], [1{,}000], [6.4], [0.993], [0.003],
-    [50K], [1{,}000], [9.7], [0.994], [0.000],
-    [100K], [1{,}000], [14.4], [0.993], [0.002],
-  ),
-  caption: [
-    Sweet-spot $d$ per $N$ (criterion: smallest $d$ giving Pearson
-    $r >= 0.993$ and $hat(h)^2$ within one regression-SE of exact),
-    measured with `--snp-level-masking` on Apple M5 Pro. The optimum
-    is approximately $N$-independent at $d approx 1{,}000$ because the
-    sketch error is set by intra-window LD structure (window size
-    $tilde$ 800-1500 SNPs), not by sample size. Wall scales mildly
-    with $N$ from the fused $O(N c)$ scatter cost; at $N = 100{,}000$
-    the recommended setting still finishes in $tilde$14 s, vs.\
-    $tilde$17 min for exact f32 ($tilde$70 #sym.times speedup). For
-    applications where exact per-SNP LD scores are critical
-    (partitioned heritability, fine-mapping), bump to $d = 5{,}000$
-    for $r >= 0.999$ at the cost of $tilde$30 s wall.
-  ],
-) <tbl:optimal-d-by-N>
 
 The universality of the accuracy curve (middle panel of @fig:optimal-d)
 is the key finding: a user choosing $d$ does not need to know $N$ in
@@ -488,6 +398,49 @@ with a dataset-dependent constant $C$; the cross-$N$ stacking of the
 empirical curves is consistent with that derivation but tightens the
 empirical claim: $C approx 8$ holds across a 200-fold $N$ range on
 this LD structure.
+
+== Controlled simulation: sketched $hat(h)^2$ recovers known heritability
+
+The accuracy results above compare sketched LD scores to exact LD scores, but
+do not by themselves establish that the *downstream* heritability estimate is
+unbiased. We therefore ran a controlled simulation with a known generative
+model on chromosome 22 of the 1000 Genomes EUR panel ($N = 503$,
+$approx$18.6K SNPs after MAF $>= 0.05$). For each of two true heritabilities
+($h^2 in {0.2, 0.5}$) we drew 50 replicate phenotypes under the infinitesimal
+model $y = G beta + epsilon$, computed marginal GWAS statistics
+($Z = G^top y \/ sqrt(N)$), and estimated $hat(h)^2$ from LD scores computed
+exactly (per-SNP masked) and with `--sketch d --snp-level-masking` for
+$d in {50, 100, 200, 350, 500}$ (CountSketch requires $d <= N$).
+
+At this sample size the exact-masked estimator recovers the true $h^2$ up to a
+small finite-sample upward bias ($hat(h)^2 = 0.211$ at $h^2 = 0.2$; $0.558$
+at $h^2 = 0.5$), matching the chunk-size simulation (Supplementary Table S4).
+The sketched estimator converges onto this exact estimate as $d$ grows
+(@fig:sketch-h2-sim): the sketch-induced bias shrinks from $-0.05$ to $-0.12$
+at $d = 50$ to within one regression standard error ($approx 0.02$) of the
+exact estimate by $d = 200$, and below $plus.minus 0.007$ by $d = 350$.
+Because sketch accuracy is governed by $d$ and the intra-window LD structure
+rather than by $N$ (@fig:optimal-d, middle panel), the recommended $d = 1000$
+---which cannot be exercised at $N = 503$ since $d <= N$---sits well past this
+convergence point: on real GWAS summary statistics it recovers per-SNP exact
+$hat(h)^2$ within $0.003$ across panel sizes (Supplementary Table S3), and at
+biobank scale the sketched estimate tracks the exact computation to within
+$0.5%$ by $d = 2{,}000$ on the (rank-deficient) synthetic panel (§Limitations).
+
+#figure(
+  image("figures/fig8_sketch_h2_sim.png", width: 80%),
+  caption: [
+    Controlled recovery of known heritability. Chromosome 22 of 1000 Genomes
+    EUR ($N = 503$); 50 replicate phenotypes per true $h^2 in {0.2, 0.5}$
+    under the infinitesimal model. Points: mean sketched $hat(h)^2$ over
+    replicates ($plus.minus$1 SE) vs.\ sketch dimension $d$
+    (`--sketch d --snp-level-masking`). Solid lines: the exact per-SNP-masked
+    $hat(h)^2$ at the same $N$; dashed lines: the true $h^2$. The exact
+    estimator carries a small finite-sample upward bias; the sketched
+    estimator converges onto it from below as $d arrow.r N$, reaching within
+    one regression SE by $d approx 200$. $d$ is capped at $N = 503$.
+  ],
+) <fig:sketch-h2-sim>
 
 == Downstream heritability and genetic correlation validation
 
@@ -736,33 +689,8 @@ analysis of the bias appears in any LDSC follow-up paper, fork, or wiki.
 To characterize this knob, we computed LD scores at six chunk sizes and ran
 the same heritability-recovery simulation as above (50 replicates per cell,
 true $h^2 in {0.2, 0.5}$). Both mean LD score and mean $hat(h)^2$ vary
-monotonically with chunk size (@tbl:chunksize-sweep):
+monotonically with chunk size (Supplementary Table S4):
 
-#figure(
-  table(
-    columns: 5,
-    align: (right, right, right, right, right),
-    table.header(
-      [*`--chunk-size`*], [*mean L2*], [*Δ L2 vs c=50*], [*$hat(h)^2$ at h²=0.2*], [*$hat(h)^2$ at h²=0.5*],
-    ),
-    table.hline(stroke: 0.5pt),
-    [25], [18.71], [$-0.13%$], [0.2115 (+5.8%)], [0.5580 (+11.6%)],
-    [50 (Python default)], [18.73], [---], [0.2115 (+5.7%)], [0.5569 (+11.4%)],
-    [100], [18.77], [+0.20%], [0.2109 (+5.4%)], [0.5556 (+11.1%)],
-    [200 (ldsc-rs default)], [18.85], [+0.62%], [0.2107 (+5.3%)], [0.5528 (+10.6%)],
-    [500], [18.91], [+0.95%], [0.2097 (+4.8%)], [0.5532 (+10.6%)],
-    [1000], [19.05], [+1.68%], [0.2092 (+4.6%)], [0.5526 (+10.5%)],
-  ),
-  caption: [
-    LD-score and heritability sensitivity to `--chunk-size`, computed on
-    chromosome 22 of 1000 Genomes EUR ($N = 503$, 18,627 SNPs after MAF
-    $gt.eq 0.05$, `--ld-wind-kb 1000`, `--global-pass`). Mean LD score grows
-    monotonically with chunk size (range 1.8% of mean) due to chunked
-    over-counting; $hat(h)^2$ correspondingly decreases. The full range of
-    the chunk-size effect on $hat(h)^2$ is $tilde$1.1 percentage points of
-    relative bias---small but systematic.
-  ],
-) <tbl:chunksize-sweep>
 
 The Pearson correlation between any two chunk sizes' LD scores is $gt.eq
 0.999$: the rank-ordering of SNPs by LD intensity is preserved across the
@@ -800,39 +728,13 @@ overlapping-block averaging.
 *ldsc-rs* (this work) is faithful to Python LDSC by default but introduces
 two configuration knobs absent from the reference: `--chunk-size`
 (default $c = 200$ for $tilde$4$times$ faster GEMM, characterized in
-@tbl:chunksize-sweep) and `--snp-level-masking` (per-SNP exact windows
+Supplementary Table S4) and `--snp-level-masking` (per-SNP exact windows
 matching GCTA's algorithmic intent and the LDSC paper's math). The latter
 flag adds $O(w + c)$ post-GEMM masking per chunk and produces LD scores
 that agree with GCTA's unbiased output at Pearson $r = 0.998$.
 
-@tbl:implementations summarizes the per-implementation algorithmic choices.
+Supplementary Table S5 summarizes the per-implementation algorithmic choices.
 
-#figure(
-  table(
-    columns: 4,
-    align: (left, left, left, left),
-    table.header(
-      [*Aspect*], [*GCTA*], [*Python LDSC*], [*ldsc-rs*],
-    ),
-    table.hline(stroke: 0.5pt),
-    [Window eviction], [Per-SNP exact], [c-SNP chunks, c=50], [c-SNP chunks, c=200 (default); per-SNP exact with `--snp-level-masking`],
-    [Block boundaries], [Two-pass overlap averaging], [Single forward pass], [Single forward pass],
-    [r² estimator default], [Biased ($+$noise floor)], [Unbiased], [Unbiased],
-    [Unbiased r² flag], [`--ld-score-adj`], [n/a (always unbiased)], [n/a (always unbiased)],
-    [Parallelism], [OpenMP per SNP], [Serial], [Rayon per chromosome + SIMD GEMM via faer],
-    [Python-LDSC parity flag], [---], [---], [`--python-compat`],
-  ),
-  caption: [
-    Algorithmic choices across the three independent LD-score implementations.
-    All three share the same theoretical definition $ell_j = sum_k r^2_(j k)$
-    but differ in windowing, edge handling, and r² estimator. GCTA's per-SNP
-    exact semantics match the LDSC paper's mathematical statement; Python
-    LDSC's chunked approximation is undocumented in the paper but inherited
-    by every Python fork. ldsc-rs's `--snp-level-masking` reproduces GCTA's
-    per-SNP semantics; `--python-compat` produces bit-identical Python LDSC
-    output (`max_abs_diff = 0` verified on chr22 1000G EUR).
-  ],
-) <tbl:implementations>
 
 The practical recommendation: users replicating prior Python LDSC results
 should pass `--python-compat`. Users computing new reference LD scores
@@ -844,31 +746,10 @@ is acceptable.
 == Feature parity
 
 ldsc-rs implements all six subcommands of the reference Python LDSC with
-complete flag compatibility (@tbl:features). This includes advanced features
+complete flag compatibility (Supplementary Table S6). This includes advanced features
 such as partitioned heritability (`--overlap-annot`), cell-type-specific
 analysis (`--h2-cts`), and continuous-annotation binning (`--cts-bin`).
 
-#figure(
-  table(
-    columns: 3,
-    align: (left, center, left),
-    table.header(
-      [*Subcommand*], [*Status*], [*Notes*],
-    ),
-    table.hline(stroke: 0.5pt),
-    [`munge-sumstats`], [#sym.checkmark], [Polars streaming; `--daner`/`--daner-n`; INFO-score handling (`--info`/`--info-min`) identical to Python LDSC],
-    [`l2` (LD scores)], [#sym.checkmark], [`--sketch`, `--fast-f32`, `--snp-level-masking`],
-    [`h2` (heritability)], [#sym.checkmark], [`--overlap-annot`, `--h2-cts`, two-step],
-    [`rg` (genetic corr.)], [#sym.checkmark], [`--intercept-h2`, multi-trait],
-    [`make-annot`], [#sym.checkmark], [BED interval annotation],
-    [`cts-annot`], [#sym.checkmark], [Continuous annotation binning],
-  ),
-  caption: [
-    Feature parity between ldsc-rs and Python LDSC. All subcommands and major
-    flags are supported. ldsc-rs adds `--sketch`, `--fast-f32`, and
-    `--snp-level-masking` as new modes not present in the original.
-  ],
-) <tbl:features>
 
 #figure(
   table(
@@ -931,86 +812,6 @@ analysis (`--h2-cts`), and continuous-annotation binning (`--cts-bin`).
   ],
 ) <tbl:tool-matrix>
 
-= Implementation
-
-== Architecture
-
-ldsc-rs is structured as a single Rust binary with six subcommands dispatched
-via `clap`. The most computationally intensive subcommand, `l2` (LD score
-computation), uses a ring-buffer GEMM architecture: genotype data is read from
-PLINK BED files in chunks of $c$ SNPs, normalized to zero mean and unit
-variance, and accumulated in a circular buffer. Within-chunk LD ($B^top B$)
-and cross-chunk LD ($A^top B$, where $A$ contains buffered SNPs still within
-the LD window) are computed via dense matrix--matrix multiplication using the
-`faer` linear algebra library @faer2024, which provides AVX2/FMA-vectorized
-GEMM with automatic thread parallelism via `rayon`.
-
-The ring-buffer design ensures memory usage is $O(N times w)$ where $w$ is
-the maximum window size in SNPs, rather than $O(N times m)$ for the full
-genotype matrix. On the 1000 Genomes panel with a 1 Mb window, this
-corresponds to approximately 50 MB rather than 33 GB.
-
-By default, window eviction occurs at chunk granularity: all SNPs within a
-chunk share the widened window of the first SNP, matching the Python
-reference. With `--snp-level-masking`, ldsc-rs applies post-GEMM masks that
-zero out $r^2$ entries for pairs outside each other's exact per-SNP window.
-The masking exploits the monotonicity of `block_left` within each chunk to
-advance a single cutoff index across the $r^2$ matrix columns, keeping the
-overhead below 1% of total runtime.
-
-== Fused CountSketch kernel
-
-For approximate LD score computation, ldsc-rs implements a CountSketch
-projection @charikar2002 @woodruff2014 that compresses the $N$-dimensional
-genotype vectors into $d$ dimensions before GEMM. The key optimization is a
-_fused_ kernel that reads packed BED genotype bytes, decodes, normalizes, and
-scatter-adds into the $d times c$ sketch buffer in a single pass, without
-materializing the $N times c$ genotype matrix.
-
-Each individual $i$ is assigned a deterministic sketch row $h(i) in {1,
-dots, d}$ and sign $s(i) in {+1, -1}$ (seed 42). The kernel operates in
-two passes over each chunk of $c$ SNPs:
-
-+ *Statistics pass.* Raw BED bytes are scanned to compute per-SNP sum,
-  count, and sum-of-squares using a 256-entry byte-level lookup table (LUT)
-  that maps each packed byte to four genotype contributions simultaneously.
-  From these, per-SNP mean $mu_j$ and inverse standard deviation
-  $sigma_j^(-1)$ are derived. This pass is branchless: the LUT avoids
-  conditional logic for the four possible genotype encodings
-  ($0, 1, 2, "missing"$).
-
-+ *Fused scatter-add pass.* A second 256-entry LUT is constructed for each
-  SNP, mapping each byte to four _pre-normalized_ values
-  $(g - mu_j) sigma_j^(-1)$ (missing values map to $0$, since imputation to
-  the mean followed by centering yields zero). Each normalized value is
-  multiplied by $s(i)$ and accumulated into $tilde(G)_(h(i), j)$. This pass
-  is parallelized over the $c$ columns via `rayon`, with each thread writing
-  to a disjoint sketch column (no synchronization needed).
-
-The sketch buffer $tilde(G) in bb(R)^(d times c)$ has memory footprint
-$d times c$ floats---for $d = 200$, $c = 200$, this is 160 KB, fitting
-comfortably in L2 cache. By contrast, materializing the full genotype chunk
-would require $N times c$ floats: 40 MB at $N = 50{,}000$, exceeding L3
-on many architectures.
-
-This fused kernel has cost $O(N c)$ per chunk, independent of $d$. The
-subsequent sketch GEMM ($tilde(G)^top tilde(G)$ and cross-chunk products)
-costs $O(d c w)$ where $w$ is the window size in SNPs. The total wall-clock
-time is therefore $T(d) = T_"scatter" + T_"GEMM" dot d$, where both
-coefficients depend on $N$, $m$, $c$, and hardware but not on each other.
-Below the crossover point $d^* = T_"scatter" / T_"GEMM"$, increasing $d$
-improves accuracy at negligible runtime cost; above $d^*$, each additional
-dimension costs linearly (@tbl:perf-biobank, @tbl:optimal-d).
-
-== Parallelism
-
-Dense GEMM (the dominant cost at 74% of runtime in exact mode) is parallelized
-internally by `faer` using `rayon`, achieving near-peak SIMD throughput on
-AVX2+FMA hardware. The block jackknife used in `h2` and `rg` subcommands
-parallelizes the 200 leave-one-out block deletions across `rayon` threads.
-File I/O uses Polars lazy evaluation for streaming CSV/TSV processing without
-loading entire files into memory.
-
 = Discussion
 
 == Practical guidance
@@ -1031,7 +832,7 @@ in the GWAS ecosystem expose each capability natively.
 For biobank-scale LD score computation ($N > 10{,}000$), the canonical
 choice is `--sketch 1000 --snp-level-masking`, established as the
 universal sweet spot by the $N times d$ sweep above (@fig:optimal-d,
-@tbl:optimal-d-by-N). At this configuration, ldsc-rs's heritability
+Supplementary Table S3). At this configuration, ldsc-rs's heritability
 estimates fall within the per-SNP exact $hat(h)^2$ "truth cluster"
 (within ${tilde}0.003$ across $N = 503$ to $N = 100{,}000$ on BMI Yengo
 2018) while running in ${tilde}9.7$ s on $N = 50{,}000$ and
@@ -1146,7 +947,7 @@ works in both the main thread and dedicated workers.
     decimals across platforms). The reported browser run used
     `--sketch 200 --snp-level-masking` for backwards-compatibility
     with an earlier deployed WASM bundle; the current default in
-    `ldsc-web` (and the recommended setting per @tbl:optimal-d-by-N)
+    `ldsc-web` (and the recommended setting per Supplementary Table S3)
     is `--sketch 1000 --snp-level-masking`, which has nearly identical
     wall on this hardware (local CLI: 9.7 s at $N = 50,000$ vs.\
     7.1 s at `--sketch 200`) but recovers the per-SNP exact $hat(h)^2$
@@ -1165,29 +966,21 @@ deployed site at
 is built and pushed by a GitHub Actions workflow on every commit to `main`,
 so the live URL always reflects the head of tree.
 
-== Chunk-level window approximation
+== Practical recommendation on windowing
 
-The reference Python LDSC implementation uses a chunk-level approximation for
-LD score window boundaries that systematically inflates LD scores by
-including SNP pairs outside each other's distance-defined window. On the
-1000 Genomes panel, this inflates mean LD scores by 12% and attenuates
-heritability estimates by approximately 16% (@tbl:masking-h2). The effect
-scales with the ratio of chunk size to window size: larger chunks (or
-smaller windows) produce greater inflation. Genetic correlation estimates
-are robust to this approximation, likely because the systematic bias cancels
-in the ratio.
-
-This approximation has been present since the original LDSC release and is
-inherited by all downstream analyses that use Python-computed LD scores.
-ldsc-rs provides `--snp-level-masking` for exact per-SNP windows with
-negligible runtime cost. We recommend `--snp-level-masking` for new LD score
-computations; for replication of existing published results, the default
-chunked mode reproduces the Python reference behavior.
+The chunk-rounding bias characterized in Results (§"Discovery" and
+§"The `--chunk-size` knob") has been present since the original LDSC
+release and is inherited by every downstream analysis that uses
+Python-computed LD scores. Our recommendation follows directly: use
+`--snp-level-masking` for new LD score computations (exact per-SNP
+windows at $<$1% overhead, matching the LDSC paper's definition and
+GCTA's intent), and the default chunked mode only when bit-for-bit
+replication of an existing Python LDSC result is required.
 
 == Limitations
 
 *Synthetic biobank dataset.* All biobank-scale numbers reported in this paper
-(@tbl:perf-biobank, @tbl:optimal-d, @fig:perf-biobank, @fig:sketch-tradeoff) are
+(@tbl:perf-biobank, Supplementary Table S2, @fig:perf-biobank, @fig:sketch-tradeoff) are
 measured on a synthetic dataset generated by replicating the 1000 Genomes
 European panel ($N = 2,490$) approximately 21-fold with 1% per-genotype noise to
 reach $N = 50,000$ individuals. This construction has four consequences that
@@ -1225,11 +1018,12 @@ its broader allele-frequency tail.
 The CountSketch approximation introduces per-SNP noise that decreases with
 sketch dimension. At $d = 50$, the Pearson correlation with exact LD scores
 is only $r = 0.84$, which may introduce meaningful bias in fine-grained
-partitioned heritability analyses. We recommend $d >= 1000$ ($r = 0.990$)
-for partitioned analyses and $d >= 2000$ ($r = 0.994$) for applications
-requiring high per-SNP accuracy. Accuracy at very high $d$ improves more
+partitioned heritability analyses. We recommend $d = 1000$ ($r = 0.990$,
+$hat(h)^2$ within $0.003$ of exact) as the default operating point, and
+$d >= 5000$ ($r >= 0.999$) for applications requiring fine-mapping-grade
+per-SNP accuracy. Accuracy at very high $d$ improves more
 slowly than the $1 - C\/d$ model predicts: $d = 10{,}000$ achieves
-$r = 0.997$, not $0.999$ (@tbl:optimal-d).
+$r = 0.997$, not $0.999$ (Supplementary Table S2).
 
 == Future work
 
@@ -1322,6 +1116,84 @@ sequential cross-chromosome pass. Cumulative differences in the LD
 computation pipeline produce per-SNP LD score differences
 (Pearson $r = 0.993$) that do not affect downstream regression estimates
 when using shared LD scores.
+
+== Architecture
+
+ldsc-rs is structured as a single Rust binary with six subcommands dispatched
+via `clap`. The most computationally intensive subcommand, `l2` (LD score
+computation), uses a ring-buffer GEMM architecture: genotype data is read from
+PLINK BED files in chunks of $c$ SNPs, normalized to zero mean and unit
+variance, and accumulated in a circular buffer. Within-chunk LD ($B^top B$)
+and cross-chunk LD ($A^top B$, where $A$ contains buffered SNPs still within
+the LD window) are computed via dense matrix--matrix multiplication using the
+`faer` linear algebra library @faer2024, which provides AVX2/FMA-vectorized
+GEMM with automatic thread parallelism via `rayon`.
+
+The ring-buffer design ensures memory usage is $O(N times w)$ where $w$ is
+the maximum window size in SNPs, rather than $O(N times m)$ for the full
+genotype matrix. On the 1000 Genomes panel with a 1 Mb window, this
+corresponds to approximately 50 MB rather than 33 GB.
+
+By default, window eviction occurs at chunk granularity: all SNPs within a
+chunk share the widened window of the first SNP, matching the Python
+reference. With `--snp-level-masking`, ldsc-rs applies post-GEMM masks that
+zero out $r^2$ entries for pairs outside each other's exact per-SNP window.
+The masking exploits the monotonicity of `block_left` within each chunk to
+advance a single cutoff index across the $r^2$ matrix columns, keeping the
+overhead below 1% of total runtime.
+
+== Fused CountSketch kernel
+
+For approximate LD score computation, ldsc-rs implements a CountSketch
+projection @charikar2002 @woodruff2014 that compresses the $N$-dimensional
+genotype vectors into $d$ dimensions before GEMM. The key optimization is a
+_fused_ kernel that reads packed BED genotype bytes, decodes, normalizes, and
+scatter-adds into the $d times c$ sketch buffer in a single pass, without
+materializing the $N times c$ genotype matrix.
+
+Each individual $i$ is assigned a deterministic sketch row $h(i) in {1,
+dots, d}$ and sign $s(i) in {+1, -1}$ (seed 42). The kernel operates in
+two passes over each chunk of $c$ SNPs:
+
++ *Statistics pass.* Raw BED bytes are scanned to compute per-SNP sum,
+  count, and sum-of-squares using a 256-entry byte-level lookup table (LUT)
+  that maps each packed byte to four genotype contributions simultaneously.
+  From these, per-SNP mean $mu_j$ and inverse standard deviation
+  $sigma_j^(-1)$ are derived. This pass is branchless: the LUT avoids
+  conditional logic for the four possible genotype encodings
+  ($0, 1, 2, "missing"$).
+
++ *Fused scatter-add pass.* A second 256-entry LUT is constructed for each
+  SNP, mapping each byte to four _pre-normalized_ values
+  $(g - mu_j) sigma_j^(-1)$ (missing values map to $0$, since imputation to
+  the mean followed by centering yields zero). Each normalized value is
+  multiplied by $s(i)$ and accumulated into $tilde(G)_(h(i), j)$. This pass
+  is parallelized over the $c$ columns via `rayon`, with each thread writing
+  to a disjoint sketch column (no synchronization needed).
+
+The sketch buffer $tilde(G) in bb(R)^(d times c)$ has memory footprint
+$d times c$ floats---for $d = 200$, $c = 200$, this is 160 KB, fitting
+comfortably in L2 cache. By contrast, materializing the full genotype chunk
+would require $N times c$ floats: 40 MB at $N = 50{,}000$, exceeding L3
+on many architectures.
+
+This fused kernel has cost $O(N c)$ per chunk, independent of $d$. The
+subsequent sketch GEMM ($tilde(G)^top tilde(G)$ and cross-chunk products)
+costs $O(d c w)$ where $w$ is the window size in SNPs. The total wall-clock
+time is therefore $T(d) = T_"scatter" + T_"GEMM" dot d$, where both
+coefficients depend on $N$, $m$, $c$, and hardware but not on each other.
+Below the crossover point $d^* = T_"scatter" / T_"GEMM"$, increasing $d$
+improves accuracy at negligible runtime cost; above $d^*$, each additional
+dimension costs linearly (@tbl:perf-biobank, Supplementary Table S2).
+
+== Parallelism
+
+Dense GEMM (the dominant cost at 74% of runtime in exact mode) is parallelized
+internally by `faer` using `rayon`, achieving near-peak SIMD throughput on
+AVX2+FMA hardware. The block jackknife used in `h2` and `rg` subcommands
+parallelizes the 200 leave-one-out block deletions across `rayon` threads.
+File I/O uses Polars lazy evaluation for streaming CSV/TSV processing without
+loading entire files into memory.
 
 == CountSketch dimensionality reduction
 
@@ -1549,7 +1421,7 @@ $d^* approx 3{,}200$ at biobank scale ($N = 50{,}000$) and $d^* approx 35$
 at 1000 Genomes scale ($N = 2{,}490$), reflecting these constant-factor
 differences.  Below $d^*$, increasing $d$ improves accuracy with no
 measurable runtime penalty---$d = 200$ costs the same as $d = 50$ but
-improves Pearson $r$ from $0.84$ to $0.96$ (@tbl:optimal-d).
+improves Pearson $r$ from $0.84$ to $0.96$ (Supplementary Table S2).
 
 The empirical accuracy law $r(d) approx 1 - 8 slash d$ for $d <= 1{,}000$
 is consistent with the $O(1 slash d)$ variance scaling derived above.  The
@@ -1588,33 +1460,11 @@ components.
 
 === Complexity comparison
 
-@tbl:sketch-complexity summarizes the asymptotic cost of LD score
+Supplementary Table S7 summarizes the asymptotic cost of LD score
 computation under exact and sketched modes. CountSketch removes a factor of
 $w$ (window size) from the dominant term, replacing dense $N$-dimensional
 GEMMs with $d$-dimensional GEMMs where $d << N$.
 
-#figure(
-  table(
-    columns: 3,
-    align: (left, left, left),
-    table.header(
-      [*Method*], [*Sketch cost*], [*GEMM cost*],
-    ),
-    table.hline(stroke: 0.5pt),
-    [Exact], [---], [$O(N c w)$ per chunk],
-    [Gaussian sketch], [$O(d N c)$], [$O(d c w)$],
-    [CountSketch], [$O(N c)$], [$O(d c w)$],
-  ),
-  caption: [
-    Asymptotic cost comparison per chunk. $N$: individuals, $c$: chunk size,
-    $w$: window size, $d$: sketch dimension. CountSketch achieves input
-    sparsity time for the projection step. For PLINK BED genotypes (dense;
-    $"nnz" approx N c$), the distinction between $O("nnz")$ and $O(N c)$
-    vanishes, but the constant-factor advantage of scatter-add (one
-    memory write per entry) over dense matrix--vector products ($d$ multiply-accumulates per entry) remains critical.
-    Gaussian sketch is shown for reference; ldsc-rs implements CountSketch only.
-  ],
-) <tbl:sketch-complexity>
 
 The deterministic seed (42) ensures reproducibility: identical `--sketch`
 invocations on identical data always produce identical output.
@@ -1629,6 +1479,24 @@ boost, 16 vCPUs, 32 GB RAM). The ldsc-rs binary was compiled with
 CPython 3.12, NumPy 1.26 (OpenBLAS), and bitarray 2.9.
 
 = Software, Data, and Reproducibility
+
+#figure(
+  table(
+    columns: 2,
+    align: (left, left),
+    stroke: none,
+    inset: (x: 4pt, y: 2pt),
+    [*Project name*], [ldsc-rs],
+    [*Project home page*], [#link("https://github.com/sharifhsn/ldsc")],
+    [*Live browser app*], [#link("https://sharifhsn.github.io/ldsc/")],
+    [*Operating systems*], [Linux (x86\_64), macOS (aarch64), Windows (x86\_64); browser (WASM) platform-independent],
+    [*Programming language*], [Rust (edition 2024); compiles to native and `wasm32-unknown-unknown`],
+    [*Other requirements*], [None at runtime (statically linked, musl); build needs a Rust toolchain],
+    [*License*], [GNU General Public License v3.0 (GPL-3.0-only)],
+    [*Restrictions for non-academics*], [None],
+  ),
+  caption: [Availability and requirements.],
+) <tbl:availability>
 
 *Source code.* ldsc-rs is released under the GNU General Public License v3.0
 at #link("https://github.com/sharifhsn/ldsc"). The fastest install path is
@@ -1655,7 +1523,7 @@ N-scaling sweep, `scripts/verify_parity_all.sh` runs the eight-mode parity
 sweep against Python LDSC, `scripts/aws-bench.sh` runs the AWS Spot
 benchmarks. Per-benchmark raw measurements and the regression
 machinery that produced @tbl:perf-1000g, @tbl:perf-biobank, and
-@tbl:optimal-d live under `preprint/data/`; figure-generation code is at
+Supplementary Table S2 live under `preprint/data/`; figure-generation code is at
 `preprint/scripts/generate_figures.py`. A Zenodo DOI archiving the exact
 commit and Docker image used for the benchmarks reported here will be
 minted at journal submission.
