@@ -47,7 +47,7 @@ The release binary is at `target/release/ldsc` (native) or `target/x86_64-unknow
 
 ## CI
 
-Defined in `.github/workflows/ci.yml`: runs `cargo check`, `cargo fmt --check`, `cargo clippy --release -- -D warnings`, and `cargo test --release` on every push/PR to main. A separate `python` job lints the bindings (`cargo clippy -p ldsc-python --release -- -D warnings`), builds the wheel with `maturin build`, and runs `pytest` against it — run this locally with `cd python && maturin build --release && pip install --force-reinstall ../target/wheels/*.whl && pytest`.
+Defined in `.github/workflows/ci.yml`: runs `cargo check`, `cargo fmt --check`, `cargo clippy --release -- -D warnings`, and `cargo test --release` on every push/PR to main. A separate `python` job lints the bindings (`cargo clippy -p ldsc-python --release -- -D warnings`), builds the wheel with `maturin build`, and runs `pytest` against it — run this locally with `cd python && pip install pytest numpy && maturin build --release && pip install --force-reinstall ../target/wheels/*.whl && pytest`.
 
 ## Architecture
 

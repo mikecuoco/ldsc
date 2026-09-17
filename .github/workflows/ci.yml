@@ -57,7 +57,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Install Python build tools
-        run: python -m pip install "maturin>=1.9.4,<2" "pytest>=8"
+        run: python -m pip install "maturin>=1.9.4,<2" "pytest>=8" numpy
 
       - name: Lint Python bindings
         run: cargo clippy -p ldsc-python --release -- -D warnings
