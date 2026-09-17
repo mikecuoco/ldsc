@@ -154,6 +154,103 @@ def test_estimate_ldscore_matches_compute_ld_scores_from_bytes(tmp_path):
     assert from_file.ld_score == pytest.approx(from_bytes.ld_score)
 
 
+def test_estimate_ldscore_out_writes_cli_compatible_files(tmp_path):
+    bed = bytes([0x6C, 0x1B, 0x01, 0xF0, 0xF0])
+    bim = "1\trs1\t0\t100\tA\tG\n1\trs2\t0\t200\tA\tG\n"
+    fam = (
+        "F1\tI1\t0\t0\t1\t-9\n"
+        "F2\tI2\t0\t0\t1\t-9\n"
+        "F3\tI3\t0\t0\t1\t-9\n"
+        "F4\tI4\t0\t0\t1\t-9\n"
+    )
+    bfile = tmp_path / "micro"
+    bfile.with_suffix(".bed").write_bytes(bed)
+    bfile.with_suffix(".bim").write_text(bim)
+    bfile.with_suffix(".fam").write_text(fam)
+    out_prefix = str(tmp_path / "micro_out")
+
+    result = estimate_ldscore(
+        str(bfile), out=out_prefix, window=("kb", 100.0), chunk_size=2
+    )
+
+    ldscore_path = f"{out_prefix}.l2.ldscore.gz"
+    with gzip.open(ldscore_path, "rt") as f:
+        lines = f.read().strip().split("\n")
+    assert lines[0].split("\t") == ["CHR", "SNP", "BP", "L2"]
+    rows = [line.split("\t") for line in lines[1:]]
+    assert [r[1] for r in rows] == list(result.snp)
+    assert [float(r[3]) for r in rows] == pytest.approx(list(result.ld_score), abs=1e-3)
+
+    with open(f"{out_prefix}.l2.M") as f:
+        m_vals = [float(v) for v in f.read().split()]
+    assert m_vals == pytest.approx([len(result.snp)])
+
+    with open(f"{out_prefix}.l2.M_5_50") as f:
+        m_5_50_vals = [float(v) for v in f.read().split()]
+    assert m_5_50_vals == pytest.approx(
+        [sum(1 for maf in result.maf if maf > 0.05)]
+    )
+
+
+def test_estimate_ldscore_out_files_loadable_by_estimate_h2(tmp_path):
+    n = 60
+    chi2, ref_ld, weight_ld, sample_size, m_snps = synthetic_h2_columns(n=n)
+    snps = [f"rs{i}" for i in range(n)]
+    z = [sqrt(v) for v in chi2]
+
+    sumstats_path = tmp_path / "trait.sumstats"
+    _write_lines(
+        sumstats_path,
+        ["SNP\tN\tZ"] + [f"{s}\t{nn}\t{zv}" for s, nn, zv in zip(snps, sample_size, z)],
+    )
+    # Write ref_ld directly via the file format estimate_ldscore(out=...)
+    # produces, so the round trip through estimate_h2 exercises the same
+    # on-disk format rather than a hand-written fixture.
+    ref_ld_path = tmp_path / "trait.l2.ldscore.gz"
+    with gzip.open(ref_ld_path, "wt") as f:
+        f.write("CHR\tSNP\tBP\tL2\n")
+        for i, (s, v) in enumerate(zip(snps, ref_ld)):
+            f.write(f"1\t{s}\t{i}\t{v:.3f}\n")
+    w_ld_path = tmp_path / "trait.w_ld.ldscore"
+    _write_lines(
+        w_ld_path,
+        ["SNP\tL2"] + [f"{s}\t{v}" for s, v in zip(snps, weight_ld)],
+    )
+
+    result = estimate_h2(
+        str(sumstats_path),
+        ref_ld=str(ref_ld_path),
+        w_ld=str(w_ld_path),
+        m_snps=m_snps,
+        n_blocks=10,
+        intercept_h2=1.0,
+    )
+    expected = fit_h2(
+        chi2, ref_ld, weight_ld, sample_size, m_snps=m_snps, n_blocks=10, intercept=1.0
+    )
+
+    assert result.heritability.value == pytest.approx(expected.heritability.value, abs=1e-3)
+
+
+def test_estimate_ldscore_without_out_writes_no_files(tmp_path):
+    bed = bytes([0x6C, 0x1B, 0x01, 0xF0, 0xF0])
+    bim = "1\trs1\t0\t100\tA\tG\n1\trs2\t0\t200\tA\tG\n"
+    fam = (
+        "F1\tI1\t0\t0\t1\t-9\n"
+        "F2\tI2\t0\t0\t1\t-9\n"
+        "F3\tI3\t0\t0\t1\t-9\n"
+        "F4\tI4\t0\t0\t1\t-9\n"
+    )
+    bfile = tmp_path / "micro"
+    bfile.with_suffix(".bed").write_bytes(bed)
+    bfile.with_suffix(".bim").write_text(bim)
+    bfile.with_suffix(".fam").write_text(fam)
+
+    estimate_ldscore(str(bfile), window=("kb", 100.0), chunk_size=2)
+
+    assert list(tmp_path.glob("*.l2.*")) == []
+
+
 def test_estimate_ldscore_annot_partitioned(tmp_path):
     bed = bytes([0x6C, 0x1B, 0x01, 0xF0, 0xF0])
     bim = "1\trs1\t0\t100\tA\tG\n1\trs2\t0\t200\tA\tG\n"

@@ -23,9 +23,7 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     in the core crate (`estimate_h2_from_files`, `estimate_rg_from_files`,
     `munge_sumstats_df`/`munge_sumstats_from_files`,
     `compute_l2_from_bfile`). `estimate_h2` auto-dispatches between
-    scalar (K==1) and partitioned (K>1) based on the loaded LD scores;
-    `estimate_ldscore` is scalar-only, matching
-    `compute_ld_scores_from_bytes`.
+    scalar (K==1) and partitioned (K>1) based on the loaded LD scores.
   - Every numeric input (1-D and 2-D) now accepts a NumPy `float64` array,
     via `python/src/pyarray.rs`'s `FloatColumn`/`FloatMatrix`, avoiding
     PyO3's per-element Python-sequence extraction for large arrays.
@@ -49,6 +47,14 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     `H2FileResult.overlap_enrichment` exposes one `OverlapEnrichmentCategory`
     per annotation (`prop_snps`/`prop_h2`/`enrichment`/`enrichment_diff_p`/
     `coefficient`).
+- **`estimate_ldscore` gained `out`**, to write `{out}.l2.ldscore.gz`/
+  `.l2.M`/`.l2.M_5_50` in the exact format the `l2` CLI writes for a
+  single `--bfile`/`--out` pair, so its output is directly loadable by
+  `estimate_h2`/`estimate_rg` (or the CLI itself) without the caller
+  re-implementing the file format. `compute_l2_from_bfile` (core crate)
+  gained the same `out` parameter and a new `write_l2_output_files`
+  helper reusing the CLI's own `write_ldscore_refs`/`format_m_vals`.
+  Omitting `out` is unchanged: computation-only, no file I/O.
 
 ## [0.5.0] — 2026-05-12
 

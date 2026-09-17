@@ -163,6 +163,7 @@ def estimate_ldscore(
     *,
     annot: Optional[str] = ...,
     thin_annot: bool = ...,
+    out: Optional[str] = ...,
     window_unit: str = ...,
     window_value: float = ...,
     chunk_size: int = ...,

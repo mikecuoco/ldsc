@@ -513,13 +513,16 @@ fn compute_ld_scores_from_bytes(
 /// `annot`/`.annot.gz` when `annot` is given (matching the CLI's
 /// explicit-path or auto-resolved-single-fileset `--annot` usage — pass a
 /// per-chromosome `bfile`/`annot` pair to match real S-LDSC workflows).
-/// See [`ldsc::l2::compute_l2_from_bfile`].
+/// Pass `out` to additionally write `{out}.l2.ldscore.gz`/`.l2.M`/
+/// `.l2.M_5_50`, exactly like the CLI, so the result is directly loadable
+/// by `estimate_h2`/`estimate_rg`. See [`ldsc::l2::compute_l2_from_bfile`].
 #[pyfunction]
 #[pyo3(signature = (
     bfile,
     *,
     annot=None,
     thin_annot=false,
+    out=None,
     window_unit="kb",
     window_value=1000.0,
     chunk_size=200,
@@ -535,6 +538,7 @@ fn estimate_ldscore(
     bfile: String,
     annot: Option<String>,
     thin_annot: bool,
+    out: Option<String>,
     window_unit: &str,
     window_value: f64,
     chunk_size: usize,
@@ -555,7 +559,9 @@ fn estimate_ldscore(
         pq_exp,
     )?;
     let result = py
-        .detach(move || compute_l2_from_bfile(&bfile, annot.as_deref(), thin_annot, config))
+        .detach(move || {
+            compute_l2_from_bfile(&bfile, annot.as_deref(), thin_annot, out.as_deref(), config)
+        })
         .map_err(value_error)?;
     Ok(ldscore_result(result))
 }

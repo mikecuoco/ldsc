@@ -367,6 +367,7 @@ def estimate_ldscore(
     *,
     annot: Optional[str] = None,
     thin_annot: bool = False,
+    out: Optional[str] = None,
     window: Tuple[str, float] = ("kb", 1_000.0),
     chunk_size: int = 200,
     dtype: str = "float64",
@@ -390,6 +391,13 @@ def estimate_ldscore(
 
     Mutually exclusive with `pq_exp` (matching the CLI's per-chromosome
     `--annot` usage, call this once per chromosome bfile/annot pair).
+
+    Pass `out` to additionally write `{out}.l2.ldscore.gz`/`.l2.M`/
+    `.l2.M_5_50`, in exactly the format the `l2` CLI writes for a single
+    (non-chromosome-looped) `--bfile`/`--out` pair — so the files are
+    directly loadable by `estimate_h2`/`estimate_rg` (or the CLI itself)
+    without writing them yourself. Omitting `out` does no file I/O; the
+    returned `LdScoreResult` is unaffected either way.
     """
     if len(window) != 2:
         raise ValueError("window must contain exactly (unit, value)")
@@ -397,6 +405,7 @@ def estimate_ldscore(
         bfile,
         annot=annot,
         thin_annot=thin_annot,
+        out=out,
         window_unit=window[0],
         window_value=window[1],
         chunk_size=chunk_size,

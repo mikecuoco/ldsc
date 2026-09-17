@@ -97,6 +97,20 @@ backward compatibility with the scalar path. `annot` mirrors the CLI's
 the same way): call `estimate_ldscore` once per chromosome for real S-LDSC
 workflows, just like `ldsc l2 --annot`. Mutually exclusive with `pq_exp`.
 
+Pass `out=<prefix>` to additionally write `{out}.l2.ldscore.gz`/`.l2.M`/
+`.l2.M_5_50`, in exactly the format the `l2` CLI writes for a single
+(non-chromosome-looped) `--bfile`/`--out` pair. This is the only way to
+produce files `estimate_h2`/`estimate_rg` (or the CLI itself) can load
+directly — omitting `out` returns the same `LdScoreResult` but does no
+file I/O:
+
+```python
+from ldsc_rs import estimate_ldscore, estimate_h2
+
+estimate_ldscore("1000G.chr1", out="1000G.chr1")
+result = estimate_h2("trait.sumstats.gz", ref_ld="1000G.chr1", w_ld="1000G.chr1")
+```
+
 ## Stratified LD Score regression (S-LDSC)
 
 `estimate_h2(..., overlap_annot=True)` computes overlap-corrected

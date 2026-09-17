@@ -1098,10 +1098,19 @@ pub fn compute_l2_from_bytes(
 /// support the CLI's per-chromosome-prefix `--annot` auto-loop (each call
 /// covers one chromosome's `--bfile`, matching real S-LDSC usage, which
 /// already calls `l2 --annot` once per chromosome).
+///
+/// `out`, if given, additionally writes `{out}.l2.ldscore.gz` +
+/// `{out}.l2.M` + `{out}.l2.M_5_50`, in the exact format the `l2` CLI
+/// writes for a single (non-chromosome-looped) `--bfile`/`--out` pair —
+/// so the result is directly loadable by `estimate_h2_from_files`/
+/// `estimate_rg_from_files` (or the CLI itself) without the caller
+/// re-implementing the file format. Omit `out` to skip file I/O
+/// entirely and use the returned [`L2Output`] in memory only.
 pub fn compute_l2_from_bfile(
     bfile: &str,
     annot: Option<&str>,
     thin_annot: bool,
+    out: Option<&str>,
     config: L2Config,
 ) -> Result<L2Output> {
     let bed_bytes =
@@ -1141,7 +1150,42 @@ pub fn compute_l2_from_bfile(
         config.annot = Some(mat);
         config.annot_names = names;
     }
-    compute_l2_from_bytes(bed_bytes, &bim_text, &fam_text, config)
+    let result = compute_l2_from_bytes(bed_bytes, &bim_text, &fam_text, config)?;
+
+    if let Some(out_prefix) = out {
+        write_l2_output_files(out_prefix, &result)?;
+    }
+
+    Ok(result)
+}
+
+/// Writes `{out_prefix}.l2.ldscore.gz` + `.l2.M` + `.l2.M_5_50` from an
+/// already-computed [`L2Output`], in the same format the `l2` CLI writes
+/// for a single `--bfile`/`--out` pair (no per-chromosome looping).
+fn write_l2_output_files(out_prefix: &str, result: &L2Output) -> Result<()> {
+    let n = result.snps.len();
+    let k = result.annot_names.len();
+    let mut l2_mat = MatF::zeros(n, k);
+    for (j, col) in result.l2_by_annot.iter().enumerate() {
+        for (i, &v) in col.iter().enumerate() {
+            l2_mat[(i, j)] = v;
+        }
+    }
+    let snp_refs: Vec<&BimRecord> = result.snps.iter().collect();
+
+    let ldscore_path = format!("{out_prefix}.l2.ldscore.gz");
+    write_ldscore_refs(&ldscore_path, &snp_refs, &l2_mat, &result.annot_names)
+        .with_context(|| format!("writing '{ldscore_path}'"))?;
+
+    let m_path = format!("{out_prefix}.l2.M");
+    std::fs::write(&m_path, format_m_vals(&result.m_vec))
+        .with_context(|| format!("writing '{m_path}'"))?;
+
+    let m_5_50_path = format!("{out_prefix}.l2.M_5_50");
+    std::fs::write(&m_5_50_path, format_m_vals(&result.m_vec_5_50))
+        .with_context(|| format!("writing '{m_5_50_path}'"))?;
+
+    Ok(())
 }
 
 /// Compute LD scores from in-memory BED / BIM / FAM contents, with
