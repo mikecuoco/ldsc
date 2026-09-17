@@ -47,7 +47,7 @@ The release binary is at `target/release/ldsc` (native) or `target/x86_64-unknow
 
 ## CI
 
-Defined in `.github/workflows/ci.yml`: runs `cargo check`, `cargo fmt --check`, `cargo clippy --release -- -D warnings`, and `cargo test --release` on every push/PR to main.
+Defined in `.github/workflows/ci.yml`: runs `cargo check`, `cargo fmt --check`, `cargo clippy --release -- -D warnings`, and `cargo test --release` on every push/PR to main. A separate `python` job lints the bindings (`cargo clippy -p ldsc-python --release -- -D warnings`), builds the wheel with `maturin build`, and runs `pytest` against it — run this locally with `cd python && maturin build --release && pip install --force-reinstall ../target/wheels/*.whl && pytest`.
 
 ## Architecture
 
@@ -57,7 +57,8 @@ All source lives in `src/`. The binary is a clap-derive CLI dispatcher (`main.rs
 
 - **`cli.rs`** — Pure clap derive structs (`MungeArgs`, `L2Args`, `H2Args`, `RgArgs`, `MakeAnnotArgs`, `CtsAnnotArgs`). No logic.
 - **`main.rs`** — CLI dispatch + global thread pool setup. Injects implicit subcommand for Python-CLI-compat `--l2`/`--h2`/`--rg` flag usage and `argv[0] == munge_sumstats.py` invocations (drop-in replacement for LDlink and other pipelines).
-- **`munge.rs`** — Polars LazyFrame pipeline for GWAS summary statistics preprocessing. Streams input without loading entire file into RAM.
+- **`munge.rs`** — GWAS summary statistics preprocessing, built on the `Frame`/`Column` abstraction in `frame.rs` (no Polars anywhere in this crate — removed entirely). `run()` (CLI) is a thin read → `munge_sumstats_df()` → write wrapper; `munge_sumstats_df()` is the pure transform chain (no disk I/O) and `munge_sumstats_from_files()` is the file-oriented, non-printing counterpart used by the Python API.
+- **`frame.rs`** — Hand-rolled `Frame`/`Column` DataFrame replacement for Polars: `read_tsv`/`write_tsv` (gzip/bzip2-aware via extension), `select`, `join_inner_on`, `filter_rows`, `hstack`, `rename`, `cast_to_f64`, `unique_first_on`, `concat_rows`.
 - **`l2/`** — LD score computation, split into submodules:
   - **`mod.rs`** (~840 lines) — `run()` orchestrator: arg validation, BIM/FAM loading, `--extract`/`--annot`/`--keep` wiring, per-chr parallel vs `--global-pass` dispatch, GPU context lifecycle, output writing, Python-style stdout summary (LD score percentiles + cross-annotation correlation matrix).
   - **`compute.rs`** (~1900 lines) — `compute_ldscore_global`: ring-buffer GEMM loop (scalar + partitioned + CountSketch paths). Also `GemmBufs`, `CountSketchProj`, fused BED-decode-normalize-scatter-add kernel, optional `--snp-level-masking` post-GEMM mask, GPU compat helpers.
@@ -65,7 +66,7 @@ All source lives in `src/`. The binary is a clap-derive CLI dispatcher (`main.rs
   - **`normalize.rs`** — `normalize_col_f{32,64}_with_stats`: impute NaN→mean, centre, unit-variance. AVX2+FMA `sum_sumsq_f32`.
   - **`snp_stats.rs`** — `compute_snp_stats`: fast BED scan for MAF + het/missing prefilter.
   - **`io.rs`** — FAM parsers (`count_fam`, `parse_fam`), SNP-set loaders, gzip TSV writers.
-- **`regressions.rs`** (~2500 lines) — h2/rg regression drivers. Scalar and partitioned paths, two-step estimator, liability-scale conversion.
+- **`regressions.rs`** (~2900 lines) — h2/rg regression drivers. Scalar and partitioned paths, two-step estimator, liability-scale conversion. CLI entrypoints (`run_h2`, `run_rg`) do file I/O + printing; computation-only counterparts (`run_h2_ldsc` in `h2.rs`, `run_hsq_ldsc`/`run_h2_ldsc_partitioned`/`run_rg_ldsc`, all K-general) do neither and back the Python API. File-oriented, non-printing counterparts to the CLI entrypoints (`estimate_h2_from_files`, `estimate_rg_from_files`) also live here, for the same reason as `munge_sumstats_from_files`.
 - **`h2.rs`** — IRWLS regression + block jackknife logic used by regressions.rs.
 - **`irwls.rs`** / **`jackknife.rs`** — Iteratively Reweighted Least Squares and parallel block jackknife (rayon `par_iter` over 200 leave-one-out blocks).
 - **`parse.rs`** — File I/O: `scan_tsv()`, `read_annot()`, `read_m_vec()`, BIM/FAM parsing, per-chromosome file concatenation.
@@ -73,6 +74,15 @@ All source lives in `src/`. The binary is a clap-derive CLI dispatcher (`main.rs
 - **`bed.rs`** — Custom PLINK BED reader (no external crate). Builder pattern: `Bed::builder(path).build()`, then `ReadOptions::builder().sid_index(vec).read(&bed)`.
 - **`gpu.rs`** — Optional (`#[cfg(feature = "gpu")]`) CUDA matmul via CubeCL.
 - **`make_annot.rs`** / **`cts_annot.rs`** — Annotation file generators.
+
+### Python API (`python/` workspace member)
+
+A separate crate, `ldsc-python` (package name `ldsc-rs` on PyPI, module `ldsc_rs`), path-depends on the root `ldsc` crate and exposes PyO3 bindings — see the root `[workspace]` in `Cargo.toml`. It is a thin translation layer only: all computation and file orchestration lives in the core crate (`h2.rs`/`regressions.rs`/`munge.rs`), never duplicated in `python/`.
+
+- **`python/src/lib.rs`** — `#[pymodule] fn _native`: pyclasses (`NativeH2Result`, `NativePartitionedH2Result`, `NativeRgResult`, `NativeLdScoreResult`, `NativeH2FileResult`, `NativeMungeSummary`) and pyfunctions. In-memory: `fit_h2`/`fit_h2_partitioned`, `fit_rg`/`fit_rg_partitioned`, `compute_ld_scores_from_bytes`. File-oriented: `estimate_h2`, `estimate_rg`, `munge_sumstats`. Every Rust call runs inside `py.detach(...)` to release the GIL.
+- **`python/src/pyarray.rs`** — `FloatColumn`/`FloatMatrix`: custom `FromPyObject` impls that borrow a NumPy `float64` array's buffer (via the `numpy` crate) when one is passed, falling back to PyO3's generic `Vec<f64>`/`Vec<Vec<f64>>` extraction for plain Python sequences. Not zero-copy end-to-end — `faer::Mat` always owns its buffer — just skips PyO3's slow per-element extraction on the way in.
+- **`python/python/ldsc_rs/__init__.py`** — Typed dataclasses (`Estimate`, `HeritabilityResult`, `PartitionedHeritabilityResult`, `GeneticCorrelationResult`, `LdScoreResult`, `H2FileResult`, `MungeSummary`) wrapping the native pyclasses, plus the public Python-facing functions.
+- Deliberately out of scope: `--overlap-annot`, `--h2-cts`, jackknife-diagnostics printing (`--print-cov`/`--print-delete-vals`). See `python/README.md` for the full scope.
 
 ### Key Data Flow (l2 subcommand)
 

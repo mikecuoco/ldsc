@@ -121,14 +121,18 @@ maturin develop
 ```
 
 ```python
-from ldsc_rs import compute_ld_scores_from_bytes, fit_h2, fit_rg
+from ldsc_rs import compute_ld_scores_from_bytes, estimate_h2, fit_h2, fit_rg, munge_sumstats
 ```
 
-The initial API is computation-only: `fit_h2` and `fit_rg` accept aligned
-in-memory columns, while `compute_ld_scores_from_bytes` accepts PLINK BED bytes
-and BIM/FAM text. Results are immutable dataclasses. File-oriented munging,
-harmonisation, and partitioned analyses remain available through the CLI until
-their I/O and presentation layers are separated from computation.
+`fit_h2`/`fit_rg` (and their partitioned, K>1 counterparts
+`fit_h2_partitioned`/`fit_rg_partitioned`) accept aligned in-memory columns;
+`compute_ld_scores_from_bytes` accepts PLINK BED bytes and BIM/FAM text.
+`estimate_h2`/`estimate_rg`/`munge_sumstats` are file-oriented, computation-only
+counterparts to the `h2`/`rg`/`munge-sumstats` CLI subcommands — same file
+loading and filtering, structured Python results instead of stdout. Results
+are immutable dataclasses; every numeric input also accepts a NumPy array.
+See `python/README.md` for the full API and its scope/limitations relative
+to the CLI (e.g. `--overlap-annot`/`--h2-cts` are CLI-only).
 
 ## Quick Start
 

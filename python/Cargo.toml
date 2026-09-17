@@ -12,4 +12,5 @@ crate-type = ["cdylib"]
 [dependencies]
 ldsc = { path = ".." }
 pyo3 = { version = "0.29", features = ["abi3-py39"] }
+numpy = "0.29"
 
