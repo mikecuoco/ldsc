@@ -1,10 +1,10 @@
 # The root Cargo.toml is *both* the `ldsc` package manifest AND the
-# workspace root. The workspace adds the `ldsc-web/` Leptos frontend and
-# `python/` PyO3 bindings as sibling members (both path-depend on `ldsc`).
-# `cargo publish` from the root only publishes `ldsc`; the sibling packages
-# have `publish = false`.
+# workspace root. The workspace adds the `ldsc-web/` Leptos frontend
+# as a sibling member (path-deps on `ldsc`). `cargo publish` from the
+# root only publishes `ldsc`, ignoring `ldsc-web` (it's `publish =
+# false`).
 [workspace]
-members = [".", "ldsc-web", "python"]
+members = [".", "ldsc-web"]
 resolver = "2"
 
 [package]

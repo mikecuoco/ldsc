@@ -26,11 +26,6 @@ pub struct H2Result {
     pub mean_chi2: f64,
     pub lambda_gc: f64,
     pub ratio: Option<(f64, f64)>,
-    /// Per-annotation h2 contributions for partitioned (K>1) LD scores.
-    /// `None` here (always the case for [`run_h2_ldsc`], which is scalar-only);
-    /// populated by [`crate::regressions::run_hsq_ldsc`] for any K.
-    pub per_annot_h2: Option<Vec<f64>>,
-    pub per_annot_h2_se: Option<Vec<f64>>,
 }
 
 fn get_separators(n: usize, n_blocks: usize) -> Vec<usize> {
@@ -434,8 +429,6 @@ pub fn run_h2_ldsc(
         mean_chi2,
         lambda_gc,
         ratio,
-        per_annot_h2: None,
-        per_annot_h2_se: None,
     })
 }
 

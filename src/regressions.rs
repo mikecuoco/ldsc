@@ -14,8 +14,8 @@ use std::io::{BufWriter, Write};
 
 use crate::cli::{H2Args, RgArgs};
 use crate::h2::{
-    H2Result, JackknifeResult, aggregate, combine_twostep, irwls_ldsc, jackknife_fast,
-    ldsc_weights, run_h2_ldsc, update_separators, weight_xy,
+    JackknifeResult, aggregate, combine_twostep, irwls_ldsc, jackknife_fast, ldsc_weights,
+    run_h2_ldsc, update_separators, weight_xy,
 };
 use crate::irwls::IrwlsResult;
 use crate::parse;
@@ -468,230 +468,6 @@ fn align_rg_alleles(merged: &Frame, z2: &ColF) -> Result<(Vec<bool>, Vec<f64>, u
     Ok((mask, z2_aligned, removed))
 }
 
-/// Options for [`estimate_h2_from_files`]. Deliberately smaller than
-/// [`H2Args`] (the CLI's clap struct): this covers the file-oriented
-/// Python API's supported subset only. `--overlap-annot`, `--h2-cts`, and
-/// jackknife-diagnostics printing are out of scope.
-#[derive(Debug, Clone)]
-pub struct H2FileOptions {
-    pub m_snps: Option<f64>,
-    pub not_m_5_50: bool,
-    pub n_blocks: usize,
-    /// K==1 only; rejected when the loaded reference LD scores carry more
-    /// than one annotation column.
-    pub two_step: Option<f64>,
-    pub intercept_h2: Option<f64>,
-    pub no_intercept: bool,
-    pub chisq_max: Option<f64>,
-    pub samp_prev: Option<f64>,
-    pub pop_prev: Option<f64>,
-}
-
-impl Default for H2FileOptions {
-    fn default() -> Self {
-        Self {
-            m_snps: None,
-            not_m_5_50: false,
-            n_blocks: 200,
-            two_step: None,
-            intercept_h2: None,
-            no_intercept: false,
-            chisq_max: None,
-            samp_prev: None,
-            pop_prev: None,
-        }
-    }
-}
-
-/// A scalar (K==1) or partitioned (K>1) h2 fit, dispatched on how many
-/// annotation columns the loaded reference LD scores carry.
-#[derive(Debug, Clone)]
-pub enum H2Estimate {
-    Scalar(H2Result),
-    Partitioned(PartitionedH2Result, Vec<String>),
-}
-
-/// [`estimate_h2_from_files`]'s return value: the fit plus metadata that
-/// isn't part of either result type.
-#[derive(Debug, Clone)]
-pub struct H2FileResult {
-    pub estimate: H2Estimate,
-    pub n_snps: usize,
-    /// Liability-scale h2, when `samp_prev`/`pop_prev` are both set.
-    pub liability_h2: Option<f64>,
-}
-
-/// File-oriented, computation-only counterpart to the `h2` CLI subcommand.
-///
-/// Loads sumstats plus reference/weight LD scores from disk, merges and
-/// filters them exactly like [`run_h2`], then dispatches to [`run_h2_ldsc`]
-/// (K==1) or [`run_h2_ldsc_partitioned`] (K>1). Emits no CLI output and
-/// writes no files. Unlike the raw in-memory [`run_h2_ldsc`]/
-/// [`run_h2_ldsc_partitioned`] entrypoints, negative LD scores are clamped
-/// to zero (matching [`run_rg`]'s own defensive clamp) rather than
-/// rejected, since real per-annotation LD scores can dip slightly below
-/// zero from estimation noise.
-pub fn estimate_h2_from_files(
-    sumstats_path: &str,
-    ref_ld: Option<&str>,
-    ref_ld_chr: Option<&str>,
-    w_ld: Option<&str>,
-    w_ld_chr: Option<&str>,
-    opts: &H2FileOptions,
-) -> Result<H2FileResult> {
-    let sumstats_df = build_sumstats_chi2(sumstats_path).context("loading sumstats")?;
-    let mut ref_ld_df = load_ld_ref(ref_ld, ref_ld_chr).context("loading ref LD scores")?;
-    cast_non_snp_to_f64(&mut ref_ld_df)?;
-    let (ref_ld_df, _keep_idx, _k_full) = drop_zero_variance_ld(&ref_ld_df)?;
-    let merged = smart_merge_on_snp(sumstats_df, ref_ld_df)
-        .context("merging sumstats with reference LD scores")?;
-    let mut w_ld_df = load_ld(w_ld, w_ld_chr, "w_l2").context("loading weight LD scores")?;
-    cast_non_snp_to_f64(&mut w_ld_df)?;
-    let merged = smart_merge_on_snp(merged, w_ld_df).context("merging with weight LD scores")?;
-
-    anyhow::ensure!(
-        merged.height() > 0,
-        "No SNPs remaining after merging sumstats with LD scores"
-    );
-
-    let non_l2_set: std::collections::HashSet<&str> =
-        ["SNP", "CHI2", "N", "w_l2"].iter().copied().collect();
-    let l2_cols: Vec<String> = merged
-        .column_names_owned()
-        .into_iter()
-        .filter(|n| !non_l2_set.contains(n.as_str()))
-        .collect();
-    let k = l2_cols.len();
-    anyhow::ensure!(k > 0, "No L2 annotation columns found in merged dataset");
-
-    let chi2_raw = extract_f64(&merged, "CHI2")?;
-    let mut w_l2_raw = extract_f64(&merged, "w_l2")?;
-    for i in 0..col_len(&w_l2_raw) {
-        w_l2_raw[(i, 0)] = w_l2_raw[(i, 0)].max(0.0);
-    }
-    let n_vec_raw = extract_f64(&merged, "N")?;
-    let ref_l2_raw_k: Vec<ColF> = l2_cols
-        .iter()
-        .map(|name| {
-            extract_f64(&merged, name).map(|mut v| {
-                for i in 0..col_len(&v) {
-                    v[(i, 0)] = v[(i, 0)].max(0.0);
-                }
-                v
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
-
-    let n_mask = col_len(&chi2_raw);
-    let valid_mask: Vec<bool> = (0..n_mask)
-        .map(|i| !chi2_raw[(i, 0)].is_nan() && !n_vec_raw[(i, 0)].is_nan())
-        .collect();
-
-    let mut chi2 = filter_by_mask(&chi2_raw, &valid_mask);
-    let mut w_l2 = filter_by_mask(&w_l2_raw, &valid_mask);
-    let mut n_vec = filter_by_mask(&n_vec_raw, &valid_mask);
-    let mut ref_l2_k: Vec<ColF> = ref_l2_raw_k
-        .iter()
-        .map(|v| filter_by_mask(v, &valid_mask))
-        .collect();
-
-    let chisq_max = if k > 1 {
-        match opts.chisq_max {
-            Some(c) => Some(c),
-            None => {
-                let mut max_n = 0.0f64;
-                for i in 0..col_len(&n_vec) {
-                    max_n = max_n.max(n_vec[(i, 0)]);
-                }
-                Some((0.001 * max_n).max(80.0))
-            }
-        }
-    } else {
-        opts.chisq_max
-    };
-
-    if let Some(chisq_max) = chisq_max {
-        let n_len = col_len(&chi2);
-        let mask: Vec<bool> = (0..n_len).map(|i| chi2[(i, 0)] < chisq_max).collect();
-        chi2 = filter_by_mask(&chi2, &mask);
-        w_l2 = filter_by_mask(&w_l2, &mask);
-        n_vec = filter_by_mask(&n_vec, &mask);
-        ref_l2_k = ref_l2_k.iter().map(|v| filter_by_mask(v, &mask)).collect();
-    }
-    let n_obs = col_len(&chi2);
-    anyhow::ensure!(n_obs > 0, "No SNPs remaining after chi2 filtering");
-
-    let fixed_intercept = if let Some(fixed) = opts.intercept_h2 {
-        Some(fixed)
-    } else if opts.no_intercept {
-        Some(1.0)
-    } else {
-        None
-    };
-    let n_blocks = n_obs.min(opts.n_blocks);
-
-    let estimate = if k > 1 {
-        anyhow::ensure!(
-            opts.two_step.is_none(),
-            "two_step is not compatible with partitioned h2 (K>1)"
-        );
-        let m_vec = resolve_m_vec(
-            opts.m_snps,
-            ref_ld_chr,
-            opts.not_m_5_50,
-            n_obs,
-            k,
-            None,
-            None,
-        );
-        let fit = run_h2_ldsc_partitioned(
-            &chi2,
-            &ref_l2_k,
-            &w_l2,
-            &n_vec,
-            &m_vec,
-            n_blocks,
-            fixed_intercept,
-        )?;
-        H2Estimate::Partitioned(fit, l2_cols)
-    } else {
-        let ref_l2 = ref_l2_k.into_iter().next().unwrap();
-        let m_snps = resolve_m(opts.m_snps, ref_ld_chr, opts.not_m_5_50, n_obs);
-        let mut two_step = opts.two_step;
-        if two_step.is_none() && fixed_intercept.is_none() {
-            two_step = Some(30.0);
-        }
-        let res = run_h2_ldsc(
-            &chi2,
-            &ref_l2,
-            &w_l2,
-            &n_vec,
-            m_snps,
-            n_blocks,
-            two_step,
-            fixed_intercept,
-        )?;
-        H2Estimate::Scalar(res)
-    };
-
-    let liability_h2 = if let (Some(samp_prev), Some(pop_prev)) = (opts.samp_prev, opts.pop_prev) {
-        let c = liability_conversion_factor(samp_prev, pop_prev);
-        let observed = match &estimate {
-            H2Estimate::Scalar(r) => r.h2,
-            H2Estimate::Partitioned(p, _) => p.h2_total,
-        };
-        Some(observed * c)
-    } else {
-        None
-    };
-
-    Ok(H2FileResult {
-        estimate,
-        n_snps: n_obs,
-        liability_h2,
-    })
-}
-
 pub fn run_h2(args: H2Args) -> Result<()> {
     if args.return_silly_things {
         println!(
@@ -839,6 +615,7 @@ pub fn run_h2(args: H2Args) -> Result<()> {
             .collect::<Vec<_>>();
     }
     let n_obs = col_len(&chi2);
+    let n_mean = col_mean(&n_vec);
 
     if k > 1 {
         if args.two_step.is_some() {
@@ -865,6 +642,7 @@ pub fn run_h2(args: H2Args) -> Result<()> {
             &n_vec,
             &l2_cols,
             n_obs,
+            n_mean,
             &args,
             Some(&m_vec),
         )?;
@@ -1221,6 +999,7 @@ fn run_h2_cts(args: &H2Args) -> Result<()> {
             &w_l2,
             &n_vec,
             n_obs,
+            n_mean,
             args,
             Some(&m_vec),
         )?;
@@ -1345,6 +1124,7 @@ fn fit_h2_partitioned(
     w_l2: &ColF,
     n_vec: &ColF,
     n_obs: usize,
+    n_mean: f64,
     args: &H2Args,
     m_override: Option<&[f64]>,
 ) -> Result<PartitionedFit> {
@@ -1368,41 +1148,8 @@ fn fit_h2_partitioned(
             None,
         )
     };
-    let n_blocks = n_obs.min(args.n_blocks);
-    let fixed_intercept = if let Some(fixed) = args.intercept_h2 {
-        Some(fixed)
-    } else if args.no_intercept {
-        Some(1.0)
-    } else {
-        None
-    };
-    partitioned_h2_core(
-        chi2,
-        ref_l2_k,
-        w_l2,
-        n_vec,
-        m_vec,
-        n_blocks,
-        fixed_intercept,
-    )
-}
-
-/// Pure computation core shared by [`fit_h2_partitioned`] (CLI, resolves M
-/// from files/args) and [`run_h2_ldsc_partitioned`] (Python-facing,
-/// resolves M from a caller-supplied slice). No file I/O, no CLI output.
-fn partitioned_h2_core(
-    chi2: &ColF,
-    ref_l2_k: &[ColF],
-    w_l2: &ColF,
-    n_vec: &ColF,
-    m_vec: Vec<f64>,
-    n_blocks: usize,
-    fixed_intercept: Option<f64>,
-) -> Result<PartitionedFit> {
-    let k = ref_l2_k.len();
-    let n_obs = col_len(chi2);
-    let n_mean = col_mean(n_vec);
     let m_total: f64 = m_vec.iter().sum();
+    let n_blocks = n_obs.min(args.n_blocks);
 
     let mut x_raw = mat_zeros(n_obs, k);
     for (j, col_v) in ref_l2_k.iter().enumerate() {
@@ -1418,6 +1165,14 @@ fn partitioned_h2_core(
         }
         x_tot[(i, 0)] = sum;
     }
+
+    let fixed_intercept = if let Some(fixed) = args.intercept_h2 {
+        Some(fixed)
+    } else if args.no_intercept {
+        Some(1.0)
+    } else {
+        None
+    };
 
     let mut y_reg = chi2.clone();
     if let Some(fixed) = fixed_intercept {
@@ -1467,143 +1222,6 @@ fn partitioned_h2_core(
         h2_total,
         intercept,
         n_blocks,
-    })
-}
-
-/// Structured, in-memory partitioned (K>=1) heritability result. Reports a
-/// per-annotation h2 breakdown alongside the total.
-#[derive(Debug, Clone)]
-pub struct PartitionedH2Result {
-    pub h2_per_annot: Vec<f64>,
-    pub h2_per_annot_se: Vec<f64>,
-    pub h2_total: f64,
-    pub h2_total_se: f64,
-    pub intercept: f64,
-    /// `None` when the intercept was constrained (`fixed_intercept` was set).
-    pub intercept_se: Option<f64>,
-    pub m_vec: Vec<f64>,
-    pub n_snps: usize,
-}
-
-/// Partitioned (K>=1) LD Score regression h2 on aligned in-memory columns.
-///
-/// Unlike [`run_h2`], this function performs no file I/O and emits no CLI
-/// output. Unlike [`run_h2_ldsc`] (strictly K==1) or [`run_hsq_ldsc`] (K>=1,
-/// totals only), this reports a per-annotation h2 breakdown, matching the
-/// `--print-coefficients` behavior of the `h2` CLI's own partitioned path.
-/// Does not support the two-step estimator, matching the CLI's own K>1
-/// restriction.
-#[allow(clippy::too_many_arguments)]
-pub fn run_h2_ldsc_partitioned(
-    chi2: &ColF,
-    ref_l2_k: &[ColF],
-    w_l2: &ColF,
-    n_vec: &ColF,
-    m_vec: &[f64],
-    n_blocks: usize,
-    fixed_intercept: Option<f64>,
-) -> Result<PartitionedH2Result> {
-    let n = col_len(chi2);
-    let k = ref_l2_k.len();
-    anyhow::ensure!(n > 0, "run_h2_ldsc_partitioned: inputs must not be empty");
-    anyhow::ensure!(k > 0, "run_h2_ldsc_partitioned: no L2 columns supplied");
-    anyhow::ensure!(
-        col_len(w_l2) == n && col_len(n_vec) == n,
-        "run_h2_ldsc_partitioned: input length mismatch"
-    );
-    for col in ref_l2_k {
-        anyhow::ensure!(
-            col_len(col) == n,
-            "run_h2_ldsc_partitioned: L2 column length mismatch"
-        );
-    }
-    anyhow::ensure!(
-        m_vec.len() == k,
-        "run_h2_ldsc_partitioned: m_vec length {} does not match K={}",
-        m_vec.len(),
-        k
-    );
-    for &m in m_vec {
-        anyhow::ensure!(
-            m.is_finite() && m > 0.0,
-            "run_h2_ldsc_partitioned: each M value must be finite and > 0"
-        );
-    }
-    anyhow::ensure!(
-        n_blocks > 1,
-        "run_h2_ldsc_partitioned: n_blocks must be > 1"
-    );
-    let n_blocks = n_blocks.min(n);
-    anyhow::ensure!(
-        n_blocks > 1,
-        "run_h2_ldsc_partitioned: at least two observations are required"
-    );
-    anyhow::ensure!(
-        fixed_intercept.is_none_or(f64::is_finite),
-        "run_h2_ldsc_partitioned: intercept must be finite"
-    );
-    for i in 0..n {
-        anyhow::ensure!(
-            chi2[(i, 0)].is_finite() && w_l2[(i, 0)].is_finite() && n_vec[(i, 0)].is_finite(),
-            "run_h2_ldsc_partitioned: all inputs must be finite"
-        );
-        anyhow::ensure!(
-            w_l2[(i, 0)] >= 0.0,
-            "run_h2_ldsc_partitioned: LD scores must be non-negative"
-        );
-        anyhow::ensure!(
-            n_vec[(i, 0)] > 0.0,
-            "run_h2_ldsc_partitioned: sample sizes must be > 0"
-        );
-        for col in ref_l2_k {
-            anyhow::ensure!(
-                col[(i, 0)].is_finite(),
-                "run_h2_ldsc_partitioned: all inputs must be finite"
-            );
-            anyhow::ensure!(
-                col[(i, 0)] >= 0.0,
-                "run_h2_ldsc_partitioned: LD scores must be non-negative"
-            );
-        }
-    }
-
-    let fit = partitioned_h2_core(
-        chi2,
-        ref_l2_k,
-        w_l2,
-        n_vec,
-        m_vec.to_vec(),
-        n_blocks,
-        fixed_intercept,
-    )?;
-
-    let scale = fit.n_mean * fit.n_mean;
-    let mut h2_per_annot_se = Vec::with_capacity(k);
-    for (j, &m) in fit.m_vec.iter().enumerate() {
-        let coef_var = (fit.jknife_cov[(j, j)] / scale).max(0.0);
-        h2_per_annot_se.push((m * m * coef_var).sqrt());
-    }
-    let mut tot_cov = 0.0;
-    for i in 0..k {
-        for j in 0..k {
-            tot_cov += fit.m_vec[i] * fit.m_vec[j] * fit.jknife_cov[(i, j)] / scale;
-        }
-    }
-    let intercept_se = if fixed_intercept.is_some() {
-        None
-    } else {
-        Some(fit.jknife_cov[(k, k)].max(0.0).sqrt())
-    };
-
-    Ok(PartitionedH2Result {
-        h2_per_annot: fit.h2_per_annot,
-        h2_per_annot_se,
-        h2_total: fit.h2_total,
-        h2_total_se: tot_cov.max(0.0).sqrt(),
-        intercept: fit.intercept,
-        intercept_se,
-        m_vec: fit.m_vec,
-        n_snps: n,
     })
 }
 
@@ -1881,10 +1499,11 @@ fn run_h2_partitioned(
     n_vec: &ColF,
     l2_cols: &[String],
     n_obs: usize,
+    n_mean: f64,
     args: &H2Args,
     m_override: Option<&[f64]>,
 ) -> Result<PartitionedFit> {
-    let fit = fit_h2_partitioned(chi2, ref_l2_k, w_l2, n_vec, n_obs, args, m_override)?;
+    let fit = fit_h2_partitioned(chi2, ref_l2_k, w_l2, n_vec, n_obs, n_mean, args, m_override)?;
 
     print_partitioned_summary(&fit, l2_cols, args);
     print_jackknife_diagnostics(
@@ -1907,25 +1526,17 @@ fn run_h2_partitioned(
     Ok(fit)
 }
 
-/// Structured result of [`run_hsq_ldsc`]. Most callers should use the
-/// simpler [`H2Result`] via [`hsq_result`] instead; this type additionally
-/// carries jackknife internals used by the CLI's `--print-cov`/
-/// `--print-delete-vals` diagnostics.
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
-pub struct HsqFit {
-    pub tot: f64,
-    pub tot_se: f64,
-    pub intercept: f64,
-    pub intercept_se: f64,
-    pub lambda_gc: f64,
-    pub mean_chi2: f64,
-    pub ratio: Option<(f64, f64)>,
-    pub tot_delete_values: ColF,
-    /// Per-annotation h2 contribution and SE, one entry per input L2 column
-    /// (length 1 when K==1).
-    pub per_annot: Vec<f64>,
-    pub per_annot_se: Vec<f64>,
+struct HsqFit {
+    tot: f64,
+    tot_se: f64,
+    intercept: f64,
+    intercept_se: f64,
+    lambda_gc: f64,
+    mean_chi2: f64,
+    ratio: Option<(f64, f64)>,
+    tot_delete_values: ColF,
 }
 
 #[derive(Debug, Clone)]
@@ -1936,46 +1547,6 @@ struct GencovFit {
     intercept_se: f64,
     mean_z1z2: f64,
     tot_delete_values: ColF,
-}
-
-/// Structured genetic-covariance estimate returned by [`run_rg_ldsc`].
-#[derive(Debug, Clone)]
-pub struct GeneticCovarianceResult {
-    pub covariance: f64,
-    pub covariance_se: f64,
-    pub intercept: f64,
-    pub intercept_se: f64,
-    pub mean_z1z2: f64,
-}
-
-/// Structured, in-memory bivariate LD Score regression result.
-///
-/// This is the computation-only counterpart to the file-oriented `rg` CLI.
-/// Inputs must already be SNP-aligned and allele-harmonised.
-#[derive(Debug, Clone)]
-pub struct GeneticCorrelationResult {
-    pub h2_1: H2Result,
-    pub h2_2: H2Result,
-    pub genetic_covariance: GeneticCovarianceResult,
-    pub rg: f64,
-    pub rg_se: f64,
-    pub z: f64,
-    pub p: f64,
-    pub n_snps: usize,
-}
-
-fn hsq_result(fit: &HsqFit) -> H2Result {
-    H2Result {
-        h2: fit.tot,
-        h2_se: fit.tot_se,
-        intercept: fit.intercept,
-        intercept_se: fit.intercept_se,
-        mean_chi2: fit.mean_chi2,
-        lambda_gc: fit.lambda_gc,
-        ratio: fit.ratio,
-        per_annot_h2: Some(fit.per_annot.clone()),
-        per_annot_h2_se: Some(fit.per_annot_se.clone()),
-    }
 }
 
 fn sum_ref_l2(ref_l2_k: &[ColF]) -> Result<ColF> {
@@ -2073,16 +1644,8 @@ fn gencov_weights(
     out
 }
 
-/// Single-trait LD Score regression h2, generalized to K>=1 annotation
-/// columns (partitioned/stratified LD scores). Performs no file I/O and
-/// emits no CLI output; the caller is responsible for supplying SNP-aligned
-/// columns and matching per-annotation M values.
-///
-/// For K==1 prefer [`run_h2_ldsc`], which additionally supports the
-/// two-step estimator's usual auto-cutoff convenience; here `two_step` is
-/// only accepted when `k == 1` (matching the CLI's own restriction).
 #[allow(clippy::too_many_arguments)]
-pub fn run_hsq_ldsc(
+fn run_hsq_ldsc(
     chi2: &ColF,
     ref_l2_k: &[ColF],
     w_l2: &ColF,
@@ -2094,7 +1657,6 @@ pub fn run_hsq_ldsc(
 ) -> Result<HsqFit> {
     let n = col_len(chi2);
     let k = ref_l2_k.len();
-    anyhow::ensure!(n > 0, "run_hsq_ldsc: inputs must not be empty");
     anyhow::ensure!(k > 0, "run_hsq_ldsc: no L2 columns");
     anyhow::ensure!(
         col_len(w_l2) == n && col_len(n_vec) == n,
@@ -2102,56 +1664,6 @@ pub fn run_hsq_ldsc(
     );
     for col in ref_l2_k {
         anyhow::ensure!(col_len(col) == n, "run_hsq_ldsc: L2 length mismatch");
-    }
-    anyhow::ensure!(
-        m_vec.len() == k,
-        "run_hsq_ldsc: m_vec length {} does not match K={}",
-        m_vec.len(),
-        k
-    );
-    for &m in m_vec {
-        anyhow::ensure!(
-            m.is_finite() && m > 0.0,
-            "run_hsq_ldsc: each M value must be finite and > 0"
-        );
-    }
-    anyhow::ensure!(n_blocks > 1, "run_hsq_ldsc: n_blocks must be > 1");
-    let n_blocks = n_blocks.min(n);
-    anyhow::ensure!(
-        n_blocks > 1,
-        "run_hsq_ldsc: at least two observations are required"
-    );
-    anyhow::ensure!(
-        two_step.is_none_or(f64::is_finite) && fixed_intercept.is_none_or(f64::is_finite),
-        "run_hsq_ldsc: estimator parameters must be finite"
-    );
-    anyhow::ensure!(
-        two_step.is_none() || k == 1,
-        "run_hsq_ldsc: two_step is not compatible with partitioned (K>1) LD scores"
-    );
-    for i in 0..n {
-        anyhow::ensure!(
-            chi2[(i, 0)].is_finite() && w_l2[(i, 0)].is_finite() && n_vec[(i, 0)].is_finite(),
-            "run_hsq_ldsc: all inputs must be finite"
-        );
-        anyhow::ensure!(
-            w_l2[(i, 0)] >= 0.0,
-            "run_hsq_ldsc: LD scores must be non-negative"
-        );
-        anyhow::ensure!(
-            n_vec[(i, 0)] > 0.0,
-            "run_hsq_ldsc: sample sizes must be > 0"
-        );
-        for col in ref_l2_k {
-            anyhow::ensure!(
-                col[(i, 0)].is_finite(),
-                "run_hsq_ldsc: all inputs must be finite"
-            );
-            anyhow::ensure!(
-                col[(i, 0)] >= 0.0,
-                "run_hsq_ldsc: LD scores must be non-negative"
-            );
-        }
     }
 
     let nbar = col_mean(n_vec);
@@ -2300,18 +1812,6 @@ pub fn run_hsq_ldsc(
         Some((r, r_se))
     };
 
-    // Per-annotation h2 contribution + SE (same formula as write_overlap_results'
-    // coef/coef_se, and fit_h2_partitioned's h2_per_annot).
-    let mut per_annot = Vec::with_capacity(k);
-    let mut per_annot_se = Vec::with_capacity(k);
-    let scale = nbar * nbar;
-    for (j, &m) in m_vec.iter().enumerate().take(k) {
-        let coef = jknife.est[(j, 0)] / nbar;
-        let coef_var = (jknife.jknife_cov[(j, j)] / scale).max(0.0);
-        per_annot.push(coef * m);
-        per_annot_se.push((m * m * coef_var).sqrt());
-    }
-
     Ok(HsqFit {
         tot,
         tot_se,
@@ -2321,8 +1821,6 @@ pub fn run_hsq_ldsc(
         mean_chi2,
         ratio,
         tot_delete_values,
-        per_annot,
-        per_annot_se,
     })
 }
 
@@ -2553,191 +2051,6 @@ fn run_gencov_ldsc(
     })
 }
 
-/// Run bivariate LD Score regression on aligned in-memory columns.
-///
-/// Unlike [`run_rg`], this function performs no file I/O and emits no CLI
-/// output. The caller is responsible for joining SNPs and aligning alleles.
-///
-/// `ref_l2_k`/`m_vec` may carry more than one annotation column (K>1,
-/// partitioned/stratified LD scores); the returned [`GeneticCorrelationResult`]
-/// always reports totals only, matching [`run_rg`]'s own behavior for
-/// multi-annotation `--ref-ld`.
-#[allow(clippy::too_many_arguments)]
-pub fn run_rg_ldsc(
-    z1: &ColF,
-    z2: &ColF,
-    ref_l2_k: &[ColF],
-    w_l2: &ColF,
-    n1: &ColF,
-    n2: &ColF,
-    m_vec: &[f64],
-    n_blocks: usize,
-    two_step: Option<f64>,
-    intercept_h2_1: Option<f64>,
-    intercept_h2_2: Option<f64>,
-    intercept_gencov: Option<f64>,
-) -> Result<GeneticCorrelationResult> {
-    let n = col_len(z1);
-    anyhow::ensure!(n > 0, "run_rg_ldsc: inputs must not be empty");
-    anyhow::ensure!(
-        col_len(z2) == n && col_len(w_l2) == n && col_len(n1) == n && col_len(n2) == n,
-        "run_rg_ldsc: input length mismatch"
-    );
-    anyhow::ensure!(!ref_l2_k.is_empty(), "run_rg_ldsc: no L2 columns supplied");
-    anyhow::ensure!(
-        m_vec.len() == ref_l2_k.len(),
-        "run_rg_ldsc: m_vec length {} does not match K={}",
-        m_vec.len(),
-        ref_l2_k.len()
-    );
-    for col in ref_l2_k {
-        anyhow::ensure!(col_len(col) == n, "run_rg_ldsc: L2 column length mismatch");
-    }
-    for &m in m_vec {
-        anyhow::ensure!(
-            m.is_finite() && m > 0.0,
-            "run_rg_ldsc: each M value must be finite and > 0"
-        );
-    }
-    anyhow::ensure!(n_blocks > 1, "run_rg_ldsc: n_blocks must be > 1");
-    let n_blocks = n_blocks.min(n);
-    anyhow::ensure!(
-        n_blocks > 1,
-        "run_rg_ldsc: at least two observations are required"
-    );
-    anyhow::ensure!(
-        two_step.is_none_or(f64::is_finite)
-            && intercept_h2_1.is_none_or(f64::is_finite)
-            && intercept_h2_2.is_none_or(f64::is_finite)
-            && intercept_gencov.is_none_or(f64::is_finite),
-        "run_rg_ldsc: estimator parameters must be finite"
-    );
-    for i in 0..n {
-        anyhow::ensure!(
-            z1[(i, 0)].is_finite()
-                && z2[(i, 0)].is_finite()
-                && w_l2[(i, 0)].is_finite()
-                && n1[(i, 0)].is_finite()
-                && n2[(i, 0)].is_finite(),
-            "run_rg_ldsc: all inputs must be finite"
-        );
-        anyhow::ensure!(
-            w_l2[(i, 0)] >= 0.0,
-            "run_rg_ldsc: LD scores must be non-negative"
-        );
-        anyhow::ensure!(
-            n1[(i, 0)] > 0.0 && n2[(i, 0)] > 0.0,
-            "run_rg_ldsc: sample sizes must be > 0"
-        );
-        for col in ref_l2_k {
-            anyhow::ensure!(
-                col[(i, 0)].is_finite(),
-                "run_rg_ldsc: all inputs must be finite"
-            );
-            anyhow::ensure!(
-                col[(i, 0)] >= 0.0,
-                "run_rg_ldsc: LD scores must be non-negative"
-            );
-        }
-    }
-
-    let mut z1_sq = col_zeros(n);
-    let mut z2_sq = col_zeros(n);
-    for i in 0..n {
-        z1_sq[(i, 0)] = z1[(i, 0)].powi(2);
-        z2_sq[(i, 0)] = z2[(i, 0)].powi(2);
-    }
-
-    let hsq1 = run_hsq_ldsc(
-        &z1_sq,
-        ref_l2_k,
-        w_l2,
-        n1,
-        m_vec,
-        n_blocks,
-        two_step,
-        intercept_h2_1,
-    )?;
-    let hsq2 = run_hsq_ldsc(
-        &z2_sq,
-        ref_l2_k,
-        w_l2,
-        n2,
-        m_vec,
-        n_blocks,
-        two_step,
-        intercept_h2_2,
-    )?;
-    let gencov = run_gencov_ldsc(
-        z1,
-        z2,
-        ref_l2_k,
-        w_l2,
-        n1,
-        n2,
-        m_vec,
-        n_blocks,
-        two_step,
-        intercept_gencov,
-        &hsq1,
-        &hsq2,
-    )?;
-
-    let (rg, rg_se) = if hsq1.tot > 0.0 && hsq2.tot > 0.0 {
-        let rg = gencov.tot / (hsq1.tot * hsq2.tot).sqrt();
-        let mut numer_delete = mat_zeros(n_blocks, 1);
-        let mut denom_delete = mat_zeros(n_blocks, 1);
-        for block in 0..n_blocks {
-            numer_delete[(block, 0)] = gencov.tot_delete_values[(block, 0)];
-            let product = hsq1.tot_delete_values[(block, 0)] * hsq2.tot_delete_values[(block, 0)];
-            denom_delete[(block, 0)] = if product.is_finite() && product >= 0.0 {
-                product.sqrt()
-            } else {
-                f64::NAN
-            };
-        }
-        let estimate = col_from_vec(vec![rg]);
-        let (_, se) = ratio_jackknife(&estimate, &numer_delete, &denom_delete);
-        (rg, se[(0, 0)])
-    } else {
-        (f64::NAN, f64::NAN)
-    };
-
-    let (z, p) = if !rg.is_finite() || !rg_se.is_finite() {
-        (f64::NAN, f64::NAN)
-    } else if rg_se != 0.0 {
-        let z = rg / rg_se;
-        let p = if z.is_finite() {
-            let chi2_dist = ChiSquared::new(1.0).expect("valid chi-squared degrees of freedom");
-            1.0 - chi2_dist.cdf(z * z)
-        } else {
-            0.0
-        };
-        (z, p)
-    } else if rg == 0.0 {
-        (f64::NAN, f64::NAN)
-    } else {
-        (rg.signum() * f64::INFINITY, 0.0)
-    };
-
-    Ok(GeneticCorrelationResult {
-        h2_1: hsq_result(&hsq1),
-        h2_2: hsq_result(&hsq2),
-        genetic_covariance: GeneticCovarianceResult {
-            covariance: gencov.tot,
-            covariance_se: gencov.tot_se,
-            intercept: gencov.intercept,
-            intercept_se: gencov.intercept_se,
-            mean_z1z2: gencov.mean_z1z2,
-        },
-        rg,
-        rg_se,
-        z,
-        p,
-        n_snps: n,
-    })
-}
-
 struct RgPairResult {
     p1: String,
     p2: String,
@@ -2795,294 +2108,6 @@ fn print_gencov_summary(gencov: &GencovFit, fixed_intercept: Option<f64>) {
             gencov.intercept, gencov.intercept_se
         );
     }
-}
-
-/// Options for [`estimate_rg_from_files`]. Deliberately smaller than
-/// [`RgArgs`] (the CLI's clap struct): covers the file-oriented Python
-/// API's supported subset only.
-#[derive(Debug, Clone)]
-pub struct RgFileOptions {
-    pub m_snps: Option<f64>,
-    pub not_m_5_50: bool,
-    pub n_blocks: usize,
-    pub two_step: Option<f64>,
-    pub chisq_max: Option<f64>,
-    pub no_check_alleles: bool,
-    pub no_intercept: bool,
-    /// One entry per trait (same length as `sumstats_paths`), or empty to
-    /// leave every h2 intercept free.
-    pub intercept_h2: Vec<f64>,
-    /// One entry per trait (index 0 is ignored, matching the CLI's
-    /// `--intercept-gencov`), or empty to leave every gencov intercept free.
-    pub intercept_gencov: Vec<f64>,
-}
-
-impl Default for RgFileOptions {
-    fn default() -> Self {
-        Self {
-            m_snps: None,
-            not_m_5_50: false,
-            n_blocks: 200,
-            two_step: None,
-            chisq_max: None,
-            no_check_alleles: false,
-            no_intercept: false,
-            intercept_h2: Vec::new(),
-            intercept_gencov: Vec::new(),
-        }
-    }
-}
-
-/// File-oriented, computation-only counterpart to the `rg` CLI subcommand.
-///
-/// Loads `sumstats_paths[0]` against every other trait in `sumstats_paths`,
-/// merges each pair with the reference/weight LD scores exactly like
-/// [`run_rg`] (including its allele-flip alignment unless
-/// `opts.no_check_alleles`), then calls [`run_rg_ldsc`] per pair. Emits no
-/// CLI output and writes no files. One [`GeneticCorrelationResult`] is
-/// returned per non-reference trait, in the same order as
-/// `sumstats_paths[1..]`.
-pub fn estimate_rg_from_files(
-    sumstats_paths: &[String],
-    ref_ld: Option<&str>,
-    ref_ld_chr: Option<&str>,
-    w_ld: Option<&str>,
-    w_ld_chr: Option<&str>,
-    opts: &RgFileOptions,
-) -> Result<Vec<GeneticCorrelationResult>> {
-    anyhow::ensure!(
-        sumstats_paths.len() >= 2,
-        "estimate_rg_from_files: at least 2 sumstats files are required"
-    );
-    let n_traits = sumstats_paths.len();
-
-    let (intercept_h2, intercept_gencov) = if opts.no_intercept {
-        (vec![Some(1.0); n_traits], vec![Some(0.0); n_traits])
-    } else {
-        let h2 = if opts.intercept_h2.is_empty() {
-            vec![None; n_traits]
-        } else {
-            anyhow::ensure!(
-                opts.intercept_h2.len() == n_traits,
-                "intercept_h2 expects one value per trait ({} values for this run)",
-                n_traits
-            );
-            opts.intercept_h2.iter().copied().map(Some).collect()
-        };
-        let gencov = if opts.intercept_gencov.is_empty() {
-            vec![None; n_traits]
-        } else {
-            anyhow::ensure!(
-                opts.intercept_gencov.len() == n_traits,
-                "intercept_gencov expects one value per trait ({} values for this run, index 0 ignored)",
-                n_traits
-            );
-            opts.intercept_gencov.iter().copied().map(Some).collect()
-        };
-        (h2, gencov)
-    };
-
-    let mut ref_ld = load_ld_ref(ref_ld, ref_ld_chr).context("loading ref LD scores")?;
-    cast_non_snp_to_f64(&mut ref_ld)?;
-    let mut w_ld = load_ld(w_ld, w_ld_chr, "w_l2").context("loading weight LD scores")?;
-    cast_non_snp_to_f64(&mut w_ld)?;
-
-    let ref_l2_cols: Vec<String> = ref_ld
-        .column_names_owned()
-        .into_iter()
-        .filter(|n| n != "SNP")
-        .collect();
-    anyhow::ensure!(
-        !ref_l2_cols.is_empty(),
-        "No L2 annotation columns found in reference LD scores"
-    );
-    let k = ref_l2_cols.len();
-
-    let file1 = &sumstats_paths[0];
-    if !opts.no_check_alleles {
-        ensure_sumstats_have_alleles(file1)?;
-    }
-    let ss1_df = if opts.no_check_alleles {
-        load_sumstats_select(
-            file1,
-            &[("SNP", "SNP", false), ("Z", "Z1", true), ("N", "N1", true)],
-        )?
-    } else {
-        load_sumstats_select(
-            file1,
-            &[
-                ("SNP", "SNP", false),
-                ("A1", "A1_1", false),
-                ("A2", "A2_1", false),
-                ("Z", "Z1", true),
-                ("N", "N1", true),
-            ],
-        )?
-    };
-    let ss1_df = ss1_df
-        .join_inner_on(&ref_ld, "SNP")
-        .context("joining sumstats with ref LD")?;
-    let ss1_df = ss1_df
-        .join_inner_on(&w_ld, "SNP")
-        .context("joining sumstats with weight LD")?;
-
-    let mut results = Vec::with_capacity(n_traits - 1);
-
-    for trait_idx in 1..n_traits {
-        let file2 = &sumstats_paths[trait_idx];
-        if !opts.no_check_alleles {
-            ensure_sumstats_have_alleles(file2)?;
-        }
-        let ss2 = if opts.no_check_alleles {
-            load_sumstats_select(
-                file2,
-                &[("SNP", "SNP", false), ("Z", "Z2", true), ("N", "N2", true)],
-            )?
-        } else {
-            load_sumstats_select(
-                file2,
-                &[
-                    ("SNP", "SNP", false),
-                    ("A1", "A1_2", false),
-                    ("A2", "A2_2", false),
-                    ("Z", "Z2", true),
-                    ("N", "N2", true),
-                ],
-            )?
-        };
-
-        let merged = smart_merge_on_snp(ss1_df.clone(), ss2)
-            .with_context(|| format!("merging {} vs {}", file1, file2))?;
-        anyhow::ensure!(
-            merged.height() > 0,
-            "No overlapping SNPs between {} and {}",
-            file1,
-            file2
-        );
-
-        let z1_raw = extract_f64(&merged, "Z1")?;
-        let z2_raw = extract_f64(&merged, "Z2")?;
-        let mut w_l2_raw = extract_f64(&merged, "w_l2")?;
-        for i in 0..col_len(&w_l2_raw) {
-            w_l2_raw[(i, 0)] = w_l2_raw[(i, 0)].max(0.0);
-        }
-        let n1_raw = extract_f64(&merged, "N1")?;
-        let n2_raw = extract_f64(&merged, "N2")?;
-        let ref_l2_raw_k: Vec<ColF> = ref_l2_cols
-            .iter()
-            .map(|name| {
-                extract_f64(&merged, name).map(|mut v| {
-                    for i in 0..col_len(&v) {
-                        v[(i, 0)] = v[(i, 0)].max(0.0);
-                    }
-                    v
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        let (z1_raw, z2_raw, w_l2_raw, n1_raw, n2_raw, ref_l2_raw_k) = if opts.no_check_alleles {
-            (z1_raw, z2_raw, w_l2_raw, n1_raw, n2_raw, ref_l2_raw_k)
-        } else {
-            let (mask, z2_aligned, _n_removed) =
-                align_rg_alleles(&merged, &z2_raw).context("aligning alleles")?;
-            let z1_f = filter_by_mask(&z1_raw, &mask);
-            let z2_f = col_from_vec(z2_aligned);
-            let w_f = filter_by_mask(&w_l2_raw, &mask);
-            let n1_f = filter_by_mask(&n1_raw, &mask);
-            let n2_f = filter_by_mask(&n2_raw, &mask);
-            let ref_f = ref_l2_raw_k
-                .iter()
-                .map(|v| filter_by_mask(v, &mask))
-                .collect::<Vec<_>>();
-            (z1_f, z2_f, w_f, n1_f, n2_f, ref_f)
-        };
-
-        let n_raw = col_len(&z1_raw);
-        let mut finite_mask = vec![true; n_raw];
-        for i in 0..n_raw {
-            if !z1_raw[(i, 0)].is_finite()
-                || !z2_raw[(i, 0)].is_finite()
-                || !w_l2_raw[(i, 0)].is_finite()
-                || !n1_raw[(i, 0)].is_finite()
-                || !n2_raw[(i, 0)].is_finite()
-            {
-                finite_mask[i] = false;
-                continue;
-            }
-            if ref_l2_raw_k.iter().any(|v| !v[(i, 0)].is_finite()) {
-                finite_mask[i] = false;
-            }
-        }
-        let z1_raw = filter_by_mask(&z1_raw, &finite_mask);
-        let z2_raw = filter_by_mask(&z2_raw, &finite_mask);
-        let w_l2_raw = filter_by_mask(&w_l2_raw, &finite_mask);
-        let n1_raw = filter_by_mask(&n1_raw, &finite_mask);
-        let n2_raw = filter_by_mask(&n2_raw, &finite_mask);
-        let ref_l2_raw_k: Vec<ColF> = ref_l2_raw_k
-            .into_iter()
-            .map(|v| filter_by_mask(&v, &finite_mask))
-            .collect();
-
-        let mut prod_raw = col_zeros(col_len(&z1_raw));
-        for i in 0..col_len(&z1_raw) {
-            prod_raw[(i, 0)] = z1_raw[(i, 0)] * z2_raw[(i, 0)];
-        }
-        let (z1, z2, w_l2, n1, n2, ref_l2_k) = if let Some(chisq_max) = opts.chisq_max {
-            let mut mask = Vec::with_capacity(col_len(&prod_raw));
-            for i in 0..col_len(&prod_raw) {
-                mask.push(prod_raw[(i, 0)].abs() < chisq_max);
-            }
-            (
-                filter_by_mask(&z1_raw, &mask),
-                filter_by_mask(&z2_raw, &mask),
-                filter_by_mask(&w_l2_raw, &mask),
-                filter_by_mask(&n1_raw, &mask),
-                filter_by_mask(&n2_raw, &mask),
-                ref_l2_raw_k
-                    .iter()
-                    .map(|v| filter_by_mask(v, &mask))
-                    .collect::<Vec<_>>(),
-            )
-        } else {
-            (z1_raw, z2_raw, w_l2_raw, n1_raw, n2_raw, ref_l2_raw_k)
-        };
-        let n_obs_filtered = col_len(&z1);
-        anyhow::ensure!(
-            n_obs_filtered > 0,
-            "No SNPs remaining after filtering for {} vs {}",
-            file1,
-            file2
-        );
-
-        let n_blocks = n_obs_filtered.min(opts.n_blocks);
-        let m_vec = resolve_m_vec(
-            opts.m_snps,
-            ref_ld_chr,
-            opts.not_m_5_50,
-            n_obs_filtered,
-            k,
-            None,
-            None,
-        );
-
-        let result = run_rg_ldsc(
-            &z1,
-            &z2,
-            &ref_l2_k,
-            &w_l2,
-            &n1,
-            &n2,
-            &m_vec,
-            n_blocks,
-            opts.two_step,
-            intercept_h2[0],
-            intercept_h2[trait_idx],
-            intercept_gencov[trait_idx],
-        )?;
-        results.push(result);
-    }
-
-    Ok(results)
 }
 
 pub fn run_rg(args: RgArgs) -> Result<()> {

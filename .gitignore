@@ -17,6 +17,3 @@ target-asm/
 target-musl/
 target-v3/
 __pycache__/
-.pytest_cache/
-python/dist/
-python/.venv/

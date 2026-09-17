@@ -1055,21 +1055,6 @@ pub fn compute_l2_from_bytes(
     compute_l2_from_bytes_with_progress(bed_bytes, bim_text, fam_text, config, |_| {})
 }
 
-/// File-oriented, computation-only counterpart to `compute_l2_from_bytes`:
-/// reads `{bfile}.bed`/`.bim`/`.fam` from disk (a PLINK `--bfile` prefix)
-/// and drives the same single-annotation (`K = 1`) path, with no
-/// `--extract`/`--keep`/`--annot` filtering. This is the only file I/O —
-/// the rest is shared, already-tested code.
-pub fn compute_l2_from_bfile(bfile: &str, config: L2Config) -> Result<L2Output> {
-    let bed_bytes =
-        std::fs::read(format!("{bfile}.bed")).with_context(|| format!("reading '{bfile}.bed'"))?;
-    let bim_text = std::fs::read_to_string(format!("{bfile}.bim"))
-        .with_context(|| format!("reading '{bfile}.bim'"))?;
-    let fam_text = std::fs::read_to_string(format!("{bfile}.fam"))
-        .with_context(|| format!("reading '{bfile}.fam'"))?;
-    compute_l2_from_bytes(bed_bytes, &bim_text, &fam_text, config)
-}
-
 /// Compute LD scores from in-memory BED / BIM / FAM contents, with
 /// a per-chunk progress callback.
 ///

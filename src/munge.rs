@@ -75,200 +75,8 @@ fn cname_lookup(upper: &str) -> Option<&'static str> {
     CNAME_MAP.iter().find(|(k, _)| *k == upper).map(|(_, v)| *v)
 }
 
-/// Munging options independent of file paths (input sumstats, output
-/// prefix, `--merge-alleles` reference) — see [`munge_sumstats_df`] and
-/// [`munge_sumstats_from_files`]. Field names and defaults mirror
-/// [`MungeArgs`]'s corresponding CLI flags exactly.
-#[derive(Debug, Clone)]
-pub struct MungeOptions {
-    pub daner: bool,
-    pub daner_n: bool,
-    pub n_min: f64,
-    pub maf: f64,
-    pub info_min: f64,
-    pub n: Option<f64>,
-    pub n_cas: Option<f64>,
-    pub n_con: Option<f64>,
-    pub snp_col: Option<String>,
-    pub n_col: Option<String>,
-    pub n_cas_col: Option<String>,
-    pub n_con_col: Option<String>,
-    pub a1_col: Option<String>,
-    pub a2_col: Option<String>,
-    pub p_col: Option<String>,
-    pub frq_col: Option<String>,
-    pub info_col: Option<String>,
-    pub signed_sumstats: Option<String>,
-    pub ignore: Option<String>,
-    pub keep_maf: bool,
-    pub a1_inc: bool,
-    pub no_alleles: bool,
-    pub info_list: Option<String>,
-    pub nstudy: Option<String>,
-    pub nstudy_min: Option<u64>,
-}
-
-impl Default for MungeOptions {
-    fn default() -> Self {
-        Self {
-            daner: false,
-            daner_n: false,
-            n_min: 0.0,
-            maf: 0.01,
-            info_min: 0.9,
-            n: None,
-            n_cas: None,
-            n_con: None,
-            snp_col: None,
-            n_col: None,
-            n_cas_col: None,
-            n_con_col: None,
-            a1_col: None,
-            a2_col: None,
-            p_col: None,
-            frq_col: None,
-            info_col: None,
-            signed_sumstats: None,
-            ignore: None,
-            keep_maf: false,
-            a1_inc: false,
-            no_alleles: false,
-            info_list: None,
-            nstudy: None,
-            nstudy_min: None,
-        }
-    }
-}
-
-impl From<&MungeArgs> for MungeOptions {
-    fn from(args: &MungeArgs) -> Self {
-        Self {
-            daner: args.daner,
-            daner_n: args.daner_n,
-            n_min: args.n_min,
-            maf: args.maf,
-            info_min: args.info_min,
-            n: args.n,
-            n_cas: args.n_cas,
-            n_con: args.n_con,
-            snp_col: args.snp_col.clone(),
-            n_col: args.n_col.clone(),
-            n_cas_col: args.n_cas_col.clone(),
-            n_con_col: args.n_con_col.clone(),
-            a1_col: args.a1_col.clone(),
-            a2_col: args.a2_col.clone(),
-            p_col: args.p_col.clone(),
-            frq_col: args.frq_col.clone(),
-            info_col: args.info_col.clone(),
-            signed_sumstats: args.signed_sumstats.clone(),
-            ignore: args.ignore.clone(),
-            keep_maf: args.keep_maf,
-            a1_inc: args.a1_inc,
-            no_alleles: args.no_alleles,
-            info_list: args.info_list.clone(),
-            nstudy: args.nstudy.clone(),
-            nstudy_min: args.nstudy_min,
-        }
-    }
-}
-
-/// Row counts from a [`munge_sumstats_df`] / [`munge_sumstats_from_files`] run.
-#[derive(Debug, Clone, Copy)]
-pub struct MungeSummary {
-    pub rows_in: usize,
-    pub rows_out: usize,
-    pub duplicates_removed: usize,
-}
-
-/// Pure `Frame` transformation: every munging step except reading the input
-/// sumstats file and writing the output file. Performs no file I/O and
-/// emits no CLI output.
-///
-/// `allele_ref`, if given, must already be loaded and prepared the way
-/// [`load_merge_alleles_ref`] produces it (columns `SNP`, `A1_M`, `A2_M`,
-/// uppercased) — this is what makes the function itself I/O-free.
-pub fn munge_sumstats_df(
-    f: Frame,
-    opts: MungeOptions,
-    allele_ref: Option<Frame>,
-) -> Result<(Frame, MungeSummary)> {
-    anyhow::ensure!(
-        !(opts.no_alleles && allele_ref.is_some()),
-        "no_alleles and a merge-alleles reference are not compatible"
-    );
-    anyhow::ensure!(
-        !(opts.daner && opts.daner_n),
-        "daner and daner_n are not compatible. Use daner for sample size from \
-         FRQ_A/FRQ_U headers, use daner_n for values from Nca/Nco columns"
-    );
-
-    let rows_in = f.height();
-    let mut opts = opts;
-    let mut f = f;
-    apply_ignore(&mut f, opts.ignore.as_deref())?;
-    apply_daner_overrides(&mut f, &mut opts)?;
-    apply_col_overrides(&mut f, &opts)?;
-    normalize_columns(&mut f)?;
-    apply_info_list(&mut f, opts.info_list.as_deref())?;
-    apply_n_override(&mut f, &opts)?;
-    filter_pvals(&mut f)?;
-    derive_z(&mut f, opts.signed_sumstats.as_deref(), opts.a1_inc)?;
-    filter_snps(&mut f, opts.maf, opts.n_min, opts.info_min, opts.no_alleles)?;
-    apply_nstudy_filter(&mut f, opts.nstudy.as_deref(), opts.nstudy_min)?;
-    if let Some(alleles) = allele_ref {
-        apply_merge_alleles_frame(&mut f, alleles)?;
-    }
-    drop_missing_required(&mut f)?;
-
-    // Select output columns: no_alleles omits A1/A2; keep_maf includes FRQ.
-    let mut out_cols: Vec<&str> = vec!["SNP"];
-    if !opts.no_alleles {
-        out_cols.push("A1");
-        out_cols.push("A2");
-    }
-    out_cols.push("Z");
-    out_cols.push("N");
-    if opts.keep_maf {
-        out_cols.push("FRQ");
-    }
-    let f = f.select(&out_cols)?;
-
-    let n_before = f.height();
-    let f = f.unique_first_on("SNP")?;
-    let duplicates_removed = n_before - f.height();
-    let rows_out = f.height();
-
-    Ok((
-        f,
-        MungeSummary {
-            rows_in,
-            rows_out,
-            duplicates_removed,
-        },
-    ))
-}
-
-/// File-oriented, computation-only counterpart to `munge_sumstats.py` /
-/// [`run`]. Loads the sumstats file (and `--merge-alleles` reference, if
-/// given), calls [`munge_sumstats_df`], then writes `out_path`. Emits no
-/// CLI output.
-pub fn munge_sumstats_from_files(
-    sumstats_path: &str,
-    opts: MungeOptions,
-    merge_alleles_path: Option<&str>,
-    out_path: &str,
-) -> Result<MungeSummary> {
-    let f = parse::scan_sumstats(sumstats_path)?;
-    let allele_ref = match merge_alleles_path {
-        Some(p) => Some(load_merge_alleles_ref(p)?),
-        None => None,
-    };
-    let (out_frame, summary) = munge_sumstats_df(f, opts, allele_ref)?;
-    frame::write_tsv(out_path, &out_frame).with_context(|| format!("writing '{}'", out_path))?;
-    Ok(summary)
-}
-
 pub fn run(args: MungeArgs) -> Result<()> {
+    let mut args = args;
     if args.no_alleles && args.merge_alleles.is_some() {
         anyhow::bail!("--no-alleles and --merge-alleles are not compatible");
     }
@@ -279,25 +87,46 @@ pub fn run(args: MungeArgs) -> Result<()> {
         );
     }
 
-    let f = parse::scan_sumstats(&args.sumstats)?;
-    let allele_ref = match args.merge_alleles.as_deref() {
-        Some(p) => Some(load_merge_alleles_ref(p)?),
-        None => None,
-    };
-    let out_path = format!("{}.sumstats.gz", args.out);
-    let opts = MungeOptions::from(&args);
-    let (out_frame, summary) = munge_sumstats_df(f, opts, allele_ref)?;
+    let mut f = parse::scan_sumstats(&args.sumstats)?;
+    apply_ignore(&mut f, args.ignore.as_deref())?;
+    apply_daner_overrides(&mut f, &mut args)?;
+    apply_col_overrides(&mut f, &args)?;
+    normalize_columns(&mut f)?;
+    apply_info_list(&mut f, args.info_list.as_deref())?;
+    apply_n_override(&mut f, &args)?;
+    filter_pvals(&mut f)?;
+    derive_z(&mut f, args.signed_sumstats.as_deref(), args.a1_inc)?;
+    filter_snps(&mut f, args.maf, args.n_min, args.info_min, args.no_alleles)?;
+    apply_nstudy_filter(&mut f, args.nstudy.as_deref(), args.nstudy_min)?;
+    if let Some(allele_path) = args.merge_alleles.clone() {
+        apply_merge_alleles(&mut f, &allele_path)?;
+    }
+    drop_missing_required(&mut f)?;
 
-    if summary.duplicates_removed > 0 {
-        println!("  Removed {} duplicate SNPs", summary.duplicates_removed);
+    // Select output columns: --no-alleles omits A1/A2; --keep-maf includes FRQ.
+    let mut out_cols: Vec<&str> = vec!["SNP"];
+    if !args.no_alleles {
+        out_cols.push("A1");
+        out_cols.push("A2");
+    }
+    out_cols.push("Z");
+    out_cols.push("N");
+    if args.keep_maf {
+        out_cols.push("FRQ");
+    }
+    let mut f = f.select(&out_cols)?;
+
+    let n_before = f.height();
+    f = f.unique_first_on("SNP")?;
+    let n_dup = n_before - f.height();
+    if n_dup > 0 {
+        println!("  Removed {} duplicate SNPs", n_dup);
     }
 
-    frame::write_tsv(&out_path, &out_frame).with_context(|| format!("writing '{}'", out_path))?;
+    let out_path = format!("{}.sumstats.gz", args.out);
+    frame::write_tsv(&out_path, &f).with_context(|| format!("writing '{}'", out_path))?;
 
-    println!(
-        "Munging complete: {} SNPs -> {}",
-        summary.rows_out, out_path
-    );
+    println!("Munging complete: {} SNPs -> {}", f.height(), out_path);
     Ok(())
 }
 
@@ -319,8 +148,8 @@ fn apply_ignore(f: &mut Frame, ignore_csv: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-fn apply_daner_overrides(f: &mut Frame, opts: &mut MungeOptions) -> Result<()> {
-    if !opts.daner && !opts.daner_n {
+fn apply_daner_overrides(f: &mut Frame, args: &mut MungeArgs) -> Result<()> {
+    if !args.daner && !args.daner_n {
         return Ok(());
     }
     let cols = f.column_names_owned();
@@ -343,7 +172,7 @@ fn apply_daner_overrides(f: &mut Frame, opts: &mut MungeOptions) -> Result<()> {
         f.rename(&frq_u, "FRQ")?;
     }
 
-    if opts.daner {
+    if args.daner {
         let frq_a = find_prefix("FRQ_A_")
             .with_context(|| "Could not find FRQ_A_* column expected for daner format")?;
         let n_con: f64 = frq_u
@@ -360,11 +189,11 @@ fn apply_daner_overrides(f: &mut Frame, opts: &mut MungeOptions) -> Result<()> {
             "  --daner: inferred N_cas = {} and N_con = {} from FRQ_[A/U] headers",
             n_cas, n_con
         );
-        opts.n_cas = Some(n_cas);
-        opts.n_con = Some(n_con);
+        args.n_cas = Some(n_cas);
+        args.n_con = Some(n_con);
     }
 
-    if opts.daner_n {
+    if args.daner_n {
         let nca = cols
             .iter()
             .find(|c| c.as_str() == "Nca")
@@ -385,17 +214,17 @@ fn apply_daner_overrides(f: &mut Frame, opts: &mut MungeOptions) -> Result<()> {
     Ok(())
 }
 
-fn apply_col_overrides(f: &mut Frame, opts: &MungeOptions) -> Result<()> {
+fn apply_col_overrides(f: &mut Frame, args: &MungeArgs) -> Result<()> {
     let overrides: &[(Option<&str>, &str)] = &[
-        (opts.snp_col.as_deref(), "SNP"),
-        (opts.n_col.as_deref(), "N"),
-        (opts.n_cas_col.as_deref(), "N_CAS"),
-        (opts.n_con_col.as_deref(), "N_CON"),
-        (opts.a1_col.as_deref(), "A1"),
-        (opts.a2_col.as_deref(), "A2"),
-        (opts.p_col.as_deref(), "P"),
-        (opts.frq_col.as_deref(), "FRQ"),
-        (opts.info_col.as_deref(), "INFO"),
+        (args.snp_col.as_deref(), "SNP"),
+        (args.n_col.as_deref(), "N"),
+        (args.n_cas_col.as_deref(), "N_CAS"),
+        (args.n_con_col.as_deref(), "N_CON"),
+        (args.a1_col.as_deref(), "A1"),
+        (args.a2_col.as_deref(), "A2"),
+        (args.p_col.as_deref(), "P"),
+        (args.frq_col.as_deref(), "FRQ"),
+        (args.info_col.as_deref(), "INFO"),
     ];
     let existing = f.column_names_owned();
     for (override_opt, canonical) in overrides {
@@ -484,9 +313,9 @@ fn apply_info_list(f: &mut Frame, info_list: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-fn apply_n_override(f: &mut Frame, opts: &MungeOptions) -> Result<()> {
+fn apply_n_override(f: &mut Frame, args: &MungeArgs) -> Result<()> {
     let h = f.height();
-    if let Some(n) = opts.n {
+    if let Some(n) = args.n {
         let v = vec![n; h];
         if f.has_column("N") {
             f.replace_column("N", Column::F64(v))?;
@@ -495,7 +324,7 @@ fn apply_n_override(f: &mut Frame, opts: &MungeOptions) -> Result<()> {
         }
         return Ok(());
     }
-    if let (Some(n_cas), Some(n_con)) = (opts.n_cas, opts.n_con) {
+    if let (Some(n_cas), Some(n_con)) = (args.n_cas, args.n_con) {
         let v = vec![n_cas + n_con; h];
         if f.has_column("N") {
             f.replace_column("N", Column::F64(v))?;
@@ -825,22 +654,15 @@ fn complement(c: &str) -> &'static str {
     }
 }
 
-/// Load and prepare a `--merge-alleles` reference file. The only disk I/O
-/// in the merge-alleles path — see [`apply_merge_alleles_frame`].
-fn load_merge_alleles_ref(allele_path: &str) -> Result<Frame> {
+fn apply_merge_alleles(f: &mut Frame, allele_path: &str) -> Result<()> {
     let mut alleles = parse::scan_sumstats(allele_path)?;
     normalize_columns(&mut alleles)?;
     alleles.uppercase_str_column("A1")?;
     alleles.uppercase_str_column("A2")?;
     alleles.rename("A1", "A1_M")?;
     alleles.rename("A2", "A2_M")?;
-    alleles.select(&["SNP", "A1_M", "A2_M"])
-}
+    let alleles = alleles.select(&["SNP", "A1_M", "A2_M"])?;
 
-/// Join + allele-match filter against an already-loaded, already-prepared
-/// merge-alleles reference (see [`load_merge_alleles_ref`]). Pure `Frame`
-/// transformation, no file I/O.
-fn apply_merge_alleles_frame(f: &mut Frame, alleles: Frame) -> Result<()> {
     let merged = f.join_inner_on(&alleles, "SNP")?;
 
     // Allele-match filter.
