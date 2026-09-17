@@ -126,6 +126,23 @@ enrichment (Finucane et al. 2015), matching the `h2` CLI's
 `prop_h2`, `enrichment` (each an `Estimate` where applicable),
 `enrichment_diff_p`, and `coefficient`.
 
+Pass `out=<prefix>` (only meaningful with `overlap_annot=True`) to
+additionally write `{out}.results`, in exactly the format the CLI's
+`h2 --overlap-annot --out {out}` writes (`print_coefficients=True` adds
+coefficient/SE/z-score columns, matching `--print-coefficients`). Omitting
+`out` does no file I/O; `overlap_enrichment` is populated either way:
+
+```python
+estimate_h2(
+    "trait.sumstats.gz",
+    ref_ld_chr="baselineLD.",
+    w_ld="weights.",
+    overlap_annot=True,
+    frqfile_chr="1000G.frq.",
+    out="trait",
+)
+```
+
 ## Scope and limitations
 
 - `--h2-cts` and `--print-cov`/`--print-delete-vals` (jackknife

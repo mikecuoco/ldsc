@@ -625,6 +625,111 @@ def test_estimate_h2_overlap_annot_disjoint_categories_matches_naive(tmp_path):
         assert cat.enrichment.value == pytest.approx(naive_prop_h2 / naive_prop_m, abs=1e-6)
 
 
+def test_estimate_h2_overlap_annot_out_writes_cli_compatible_results_file(tmp_path):
+    n = 100
+    chi2, ref_ld, weight_ld, sample_size, _m_vec = synthetic_partitioned_h2_columns(n=n)
+    snps = [f"rs{i}" for i in range(n)]
+    z = [sqrt(v) for v in chi2]
+
+    sumstats_path = tmp_path / "trait.sumstats"
+    _write_lines(
+        sumstats_path,
+        ["SNP\tN\tZ"] + [f"{s}\t{nn}\t{zv}" for s, nn, zv in zip(snps, sample_size, z)],
+    )
+    ref_ld_path = tmp_path / "trait.l2.ldscore"
+    _write_lines(
+        ref_ld_path,
+        ["SNP\tL2A\tL2B"] + [f"{s}\t{a}\t{b}" for s, (a, b) in zip(snps, ref_ld)],
+    )
+    w_ld_path = tmp_path / "trait.w_ld.ldscore"
+    _write_lines(
+        w_ld_path,
+        ["SNP\tL2"] + [f"{s}\t{v}" for s, v in zip(snps, weight_ld)],
+    )
+    annot_path = tmp_path / "trait.l2.ldscore.annot"
+    annot_lines = ["CHR\tSNP\tBP\tCM\tCatA\tCatB"]
+    for i, s in enumerate(snps):
+        in_a = 1 if i < n // 2 else 0
+        annot_lines.append(f"1\t{s}\t{i}\t0\t{in_a}\t{1 - in_a}")
+    _write_lines(annot_path, annot_lines)
+    out_prefix = str(tmp_path / "trait_out")
+
+    result = estimate_h2(
+        str(sumstats_path),
+        ref_ld=str(ref_ld_path),
+        w_ld=str(w_ld_path),
+        n_blocks=10,
+        not_m_5_50=True,
+        overlap_annot=True,
+        out=out_prefix,
+        print_coefficients=True,
+    )
+
+    results_path = f"{out_prefix}.results"
+    with open(results_path) as f:
+        lines = f.read().strip().split("\n")
+    header = lines[0].split("\t")
+    assert header == [
+        "Category",
+        "Prop._SNPs",
+        "Prop._h2",
+        "Prop._h2_std_error",
+        "Enrichment",
+        "Enrichment_std_error",
+        "Enrichment_p",
+        "Coefficient",
+        "Coefficient_std_error",
+        "Coefficient_z-score",
+    ]
+    rows = [line.split("\t") for line in lines[1:]]
+    assert [r[0] for r in rows] == [c.name for c in result.overlap_enrichment]
+    for row, cat in zip(rows, result.overlap_enrichment):
+        assert float(row[1]) == pytest.approx(cat.prop_snps, abs=1e-6)
+        assert float(row[2]) == pytest.approx(cat.prop_h2.value, abs=1e-6)
+        assert float(row[4]) == pytest.approx(cat.enrichment.value, abs=1e-6)
+        assert float(row[7]) == pytest.approx(cat.coefficient.value, rel=1e-6)
+
+
+def test_estimate_h2_without_out_writes_no_results_file(tmp_path):
+    n = 100
+    chi2, ref_ld, weight_ld, sample_size, _m_vec = synthetic_partitioned_h2_columns(n=n)
+    snps = [f"rs{i}" for i in range(n)]
+    z = [sqrt(v) for v in chi2]
+
+    sumstats_path = tmp_path / "trait.sumstats"
+    _write_lines(
+        sumstats_path,
+        ["SNP\tN\tZ"] + [f"{s}\t{nn}\t{zv}" for s, nn, zv in zip(snps, sample_size, z)],
+    )
+    ref_ld_path = tmp_path / "trait.l2.ldscore"
+    _write_lines(
+        ref_ld_path,
+        ["SNP\tL2A\tL2B"] + [f"{s}\t{a}\t{b}" for s, (a, b) in zip(snps, ref_ld)],
+    )
+    w_ld_path = tmp_path / "trait.w_ld.ldscore"
+    _write_lines(
+        w_ld_path,
+        ["SNP\tL2"] + [f"{s}\t{v}" for s, v in zip(snps, weight_ld)],
+    )
+    annot_path = tmp_path / "trait.l2.ldscore.annot"
+    annot_lines = ["CHR\tSNP\tBP\tCM\tCatA\tCatB"]
+    for i, s in enumerate(snps):
+        in_a = 1 if i < n // 2 else 0
+        annot_lines.append(f"1\t{s}\t{i}\t0\t{in_a}\t{1 - in_a}")
+    _write_lines(annot_path, annot_lines)
+
+    estimate_h2(
+        str(sumstats_path),
+        ref_ld=str(ref_ld_path),
+        w_ld=str(w_ld_path),
+        n_blocks=10,
+        not_m_5_50=True,
+        overlap_annot=True,
+    )
+
+    assert list(tmp_path.glob("*.results")) == []
+
+
 def test_estimate_h2_overlap_annot_requires_frqfile_without_not_m_5_50(tmp_path):
     n = 20
     chi2, ref_ld, weight_ld, sample_size, _m_vec = synthetic_partitioned_h2_columns(n=n)

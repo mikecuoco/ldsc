@@ -193,6 +193,8 @@ def estimate_h2(
     overlap_annot: bool = ...,
     frqfile: Optional[str] = ...,
     frqfile_chr: Optional[str] = ...,
+    out: Optional[str] = ...,
+    print_coefficients: bool = ...,
 ) -> NativeH2FileResult: ...
 
 def estimate_rg(

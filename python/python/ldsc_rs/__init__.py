@@ -437,6 +437,8 @@ def estimate_h2(
     overlap_annot: bool = False,
     frqfile: Optional[str] = None,
     frqfile_chr: Optional[str] = None,
+    out: Optional[str] = None,
+    print_coefficients: bool = False,
 ) -> H2FileResult:
     """File-oriented, computation-only counterpart to the `h2` CLI subcommand.
 
@@ -451,6 +453,14 @@ def estimate_h2(
     `not_m_5_50=True`, this also requires `frqfile` (with `ref_ld`) or
     `frqfile_chr` (with `ref_ld_chr`) to restrict M-counts to
     0.05 < MAF < 0.95, matching the CLI.
+
+    `out`/`print_coefficients` are only meaningful together with
+    `overlap_annot=True`: they additionally write `{out}.results`, in
+    exactly the format the CLI's `h2 --overlap-annot --out {out}` writes
+    (`--print-coefficients` adds coefficient/SE/z-score columns).
+    Omitting `out` does no file I/O; `H2FileResult.overlap_enrichment` is
+    populated either way — like `estimate_ldscore`, the returned result
+    doesn't depend on whether you also asked for a file.
     """
     result = _native.estimate_h2(
         sumstats,
@@ -470,6 +480,8 @@ def estimate_h2(
         overlap_annot=overlap_annot,
         frqfile=frqfile,
         frqfile_chr=frqfile_chr,
+        out=out,
+        print_coefficients=print_coefficients,
     )
     ratio = None if result.ratio is None else Estimate(result.ratio[0], result.ratio[1])
     per_annotation = None

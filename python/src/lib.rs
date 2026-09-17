@@ -689,7 +689,10 @@ impl From<MungeSummary> for NativeMungeSummary {
 }
 
 /// File-oriented, computation-only counterpart to the `h2` CLI subcommand.
-/// See [`ldsc::regressions::estimate_h2_from_files`].
+/// Pass `out` (only meaningful with `overlap_annot=True`) to additionally
+/// write `{out}.results`, exactly like the CLI's
+/// `--overlap-annot --out {out}`. See
+/// [`ldsc::regressions::estimate_h2_from_files`].
 #[pyfunction]
 #[pyo3(signature = (
     sumstats,
@@ -709,7 +712,9 @@ impl From<MungeSummary> for NativeMungeSummary {
     pop_prev=None,
     overlap_annot=false,
     frqfile=None,
-    frqfile_chr=None
+    frqfile_chr=None,
+    out=None,
+    print_coefficients=false
 ))]
 #[allow(clippy::too_many_arguments)]
 fn estimate_h2(
@@ -731,6 +736,8 @@ fn estimate_h2(
     overlap_annot: bool,
     frqfile: Option<String>,
     frqfile_chr: Option<String>,
+    out: Option<String>,
+    print_coefficients: bool,
 ) -> PyResult<NativeH2FileResult> {
     let opts = H2FileOptions {
         m_snps,
@@ -745,6 +752,8 @@ fn estimate_h2(
         overlap_annot,
         frqfile,
         frqfile_chr,
+        out,
+        print_coefficients,
     };
     let result = py
         .detach(move || {

@@ -55,6 +55,15 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   gained the same `out` parameter and a new `write_l2_output_files`
   helper reusing the CLI's own `write_ldscore_refs`/`format_m_vals`.
   Omitting `out` is unchanged: computation-only, no file I/O.
+- **`estimate_h2` gained `out`/`print_coefficients`** (meaningful only
+  with `overlap_annot=True`), to write `{out}.results` in the exact
+  format the `h2` CLI's `--overlap-annot --out {out}` (optionally
+  `--print-coefficients`) writes. `write_overlap_results` (core crate)
+  was split further into a new public `write_overlap_enrichment_file`
+  that formats an already-computed `OverlapEnrichmentResult` directly,
+  so `estimate_h2_from_files` writes the file without recomputing the
+  enrichment math it already has. Omitting `out` is unchanged:
+  `H2FileResult.overlap_enrichment` is populated either way, no file I/O.
 
 ## [0.5.0] — 2026-05-12
 

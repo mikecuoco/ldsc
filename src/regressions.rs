@@ -496,6 +496,15 @@ pub struct H2FileOptions {
     pub frqfile: Option<String>,
     /// Per-chromosome counterpart to `frqfile` (`--frqfile-chr`).
     pub frqfile_chr: Option<String>,
+    /// `overlap_annot` only: additionally write `{out}.results` in the
+    /// exact format the `h2` CLI's `--overlap-annot --out {out}` writes,
+    /// via [`write_overlap_enrichment_file`]. `None` does no file I/O;
+    /// [`H2FileResult::overlap_enrichment`] is populated either way.
+    pub out: Option<String>,
+    /// Matches the CLI's `--print-coefficients`: adds coefficient/SE/
+    /// z-score columns to the `.results` file. Only affects the file
+    /// written via `out`; ignored otherwise.
+    pub print_coefficients: bool,
 }
 
 impl Default for H2FileOptions {
@@ -513,6 +522,8 @@ impl Default for H2FileOptions {
             overlap_annot: false,
             frqfile: None,
             frqfile_chr: None,
+            out: None,
+            print_coefficients: false,
         }
     }
 }
@@ -708,7 +719,11 @@ pub fn estimate_h2_from_files(
                 overlap_names.len(),
                 l2_cols.len()
             );
-            overlap_enrichment = Some(compute_overlap_enrichment(&fit, &l2_cols, &overlap, m_tot)?);
+            let enrichment = compute_overlap_enrichment(&fit, &l2_cols, &overlap, m_tot)?;
+            if let Some(out_prefix) = opts.out.as_deref() {
+                write_overlap_enrichment_file(&enrichment, opts.print_coefficients, out_prefix)?;
+            }
+            overlap_enrichment = Some(enrichment);
         }
 
         let result = partitioned_result_from_fit(&fit, n_obs);
@@ -1953,6 +1968,19 @@ fn write_overlap_results(
     out_prefix: &str,
 ) -> Result<()> {
     let r = compute_overlap_enrichment(fit, category_names, overlap, m_tot)?;
+    write_overlap_enrichment_file(&r, print_coefficients, out_prefix)
+}
+
+/// Formats and writes `{out_prefix}.results` from an already-computed
+/// [`OverlapEnrichmentResult`]. Split out of [`write_overlap_results`] so
+/// callers that already have the struct (the `--overlap-annot` path of
+/// [`estimate_h2_from_files`], via `H2FileOptions::out`) can write the same
+/// file without recomputing the enrichment math.
+pub fn write_overlap_enrichment_file(
+    r: &OverlapEnrichmentResult,
+    print_coefficients: bool,
+    out_prefix: &str,
+) -> Result<()> {
     let k = r.category_names.len();
 
     let out_path = format!("{}.results", out_prefix);
