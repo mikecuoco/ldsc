@@ -38,3 +38,38 @@ jobs:
 
       - name: cargo test
         run: cargo test --release  # ldscore_smoke is #[ignore] — needs large BED file
+
+  python:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.9", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install Python build tools
+        run: python -m pip install "maturin>=1.9.4,<2" "pytest>=8"
+
+      - name: Lint Python bindings
+        run: cargo clippy -p ldsc-python --release -- -D warnings
+
+      - name: Build wheel
+        working-directory: python
+        run: maturin build --release --out dist
+
+      - name: Install wheel
+        working-directory: python
+        run: python -m pip install dist/*.whl
+
+      - name: Test Python API
+        working-directory: python
+        run: python -m pytest -q
