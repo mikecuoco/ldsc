@@ -498,7 +498,12 @@ fn decode_column<T: BedVal>(
         let full_bytes = n_iid / 4;
         let remainder = n_iid % 4;
         let (bulk, tail) = out_col[..n_iid].split_at_mut(full_bytes * 4);
-        for (chunk, &byte) in bulk.chunks_exact_mut(4).zip(&bytes[..full_bytes]) {
+        for (chunk, &byte) in bulk
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .zip(&bytes[..full_bytes])
+        {
             chunk[0] = lut[(byte & 0b11) as usize];
             chunk[1] = lut[((byte >> 2) & 0b11) as usize];
             chunk[2] = lut[((byte >> 4) & 0b11) as usize];
