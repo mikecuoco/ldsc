@@ -110,6 +110,30 @@ Local install options:
 - Prebuilt binaries from GitHub Releases (see [Prebuilt Binaries](#prebuilt-binaries) below).
 - Cargo install (requires Rust ≥ 1.85): `cargo install ldsc`
 
+### Experimental Python API
+
+The `python/` workspace package provides native PyO3 bindings to the same Rust
+numerical core used by the CLI and web application:
+
+```bash
+cd python
+maturin develop
+```
+
+```python
+from ldsc_rs import compute_ld_scores_from_bytes, estimate_h2, fit_h2, fit_rg, munge_sumstats
+```
+
+`fit_h2`/`fit_rg` (and their partitioned, K>1 counterparts
+`fit_h2_partitioned`/`fit_rg_partitioned`) accept aligned in-memory columns;
+`compute_ld_scores_from_bytes` accepts PLINK BED bytes and BIM/FAM text.
+`estimate_h2`/`estimate_rg`/`munge_sumstats` are file-oriented, computation-only
+counterparts to the `h2`/`rg`/`munge-sumstats` CLI subcommands — same file
+loading and filtering, structured Python results instead of stdout. Results
+are immutable dataclasses; every numeric input also accepts a NumPy array.
+See `python/README.md` for the full API and its scope/limitations relative
+to the CLI (e.g. `--overlap-annot`/`--h2-cts` are CLI-only).
+
 ## Quick Start
 
 Two common workflows. Both produce numerically identical h²/rg output to
