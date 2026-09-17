@@ -470,8 +470,8 @@ fn align_rg_alleles(merged: &Frame, z2: &ColF) -> Result<(Vec<bool>, Vec<f64>, u
 
 /// Options for [`estimate_h2_from_files`]. Deliberately smaller than
 /// [`H2Args`] (the CLI's clap struct): this covers the file-oriented
-/// Python API's supported subset only. `--overlap-annot`, `--h2-cts`, and
-/// jackknife-diagnostics printing are out of scope.
+/// Python API's supported subset only. `--h2-cts` and jackknife-diagnostics
+/// printing are out of scope.
 #[derive(Debug, Clone)]
 pub struct H2FileOptions {
     pub m_snps: Option<f64>,
@@ -485,6 +485,17 @@ pub struct H2FileOptions {
     pub chisq_max: Option<f64>,
     pub samp_prev: Option<f64>,
     pub pop_prev: Option<f64>,
+    /// K>1 only: compute overlap-corrected enrichment (Finucane et al.
+    /// 2015 `--overlap-annot`) from the `.annot[.gz|.bz2]` files alongside
+    /// `ref_ld`/`ref_ld_chr`, populating [`H2FileResult::overlap_enrichment`].
+    pub overlap_annot: bool,
+    /// `.frq[.gz|.bz2]` prefix restricting the overlap M-counts to
+    /// 0.05 < MAF < 0.95, matching the CLI's `--frqfile`. Ignored when
+    /// `not_m_5_50` is set (matching the CLI's own warning-and-ignore
+    /// behavior). Mutually exclusive with `frqfile_chr`.
+    pub frqfile: Option<String>,
+    /// Per-chromosome counterpart to `frqfile` (`--frqfile-chr`).
+    pub frqfile_chr: Option<String>,
 }
 
 impl Default for H2FileOptions {
@@ -499,6 +510,9 @@ impl Default for H2FileOptions {
             chisq_max: None,
             samp_prev: None,
             pop_prev: None,
+            overlap_annot: false,
+            frqfile: None,
+            frqfile_chr: None,
         }
     }
 }
@@ -519,6 +533,9 @@ pub struct H2FileResult {
     pub n_snps: usize,
     /// Liability-scale h2, when `samp_prev`/`pop_prev` are both set.
     pub liability_h2: Option<f64>,
+    /// Set when `opts.overlap_annot` was requested and the estimate was
+    /// partitioned (K>1); `None` otherwise.
+    pub overlap_enrichment: Option<OverlapEnrichmentResult>,
 }
 
 /// File-oriented, computation-only counterpart to the `h2` CLI subcommand.
@@ -539,6 +556,15 @@ pub fn estimate_h2_from_files(
     w_ld_chr: Option<&str>,
     opts: &H2FileOptions,
 ) -> Result<H2FileResult> {
+    if opts.overlap_annot && !opts.not_m_5_50 {
+        let ok = (opts.frqfile.is_some() && ref_ld.is_some())
+            || (opts.frqfile_chr.is_some() && ref_ld_chr.is_some());
+        anyhow::ensure!(
+            ok,
+            "overlap_annot requires either (frqfile and ref_ld) or (frqfile_chr and ref_ld_chr), unless not_m_5_50 is set"
+        );
+    }
+
     let sumstats_df = build_sumstats_chi2(sumstats_path).context("loading sumstats")?;
     let mut ref_ld_df = load_ld_ref(ref_ld, ref_ld_chr).context("loading ref LD scores")?;
     cast_non_snp_to_f64(&mut ref_ld_df)?;
@@ -630,6 +656,7 @@ pub fn estimate_h2_from_files(
     };
     let n_blocks = n_obs.min(opts.n_blocks);
 
+    let mut overlap_enrichment = None;
     let estimate = if k > 1 {
         anyhow::ensure!(
             opts.two_step.is_none(),
@@ -644,7 +671,7 @@ pub fn estimate_h2_from_files(
             None,
             None,
         );
-        let fit = run_h2_ldsc_partitioned(
+        let fit = partitioned_h2_core_validated(
             &chi2,
             &ref_l2_k,
             &w_l2,
@@ -653,7 +680,39 @@ pub fn estimate_h2_from_files(
             n_blocks,
             fixed_intercept,
         )?;
-        H2Estimate::Partitioned(fit, l2_cols)
+
+        if opts.overlap_annot {
+            let chr_split = ref_ld_chr.is_some();
+            let prefixes = if let Some(prefix) = ref_ld_chr {
+                split_paths(prefix)
+            } else {
+                split_paths(ref_ld.unwrap_or_default())
+            };
+            let (overlap, m_tot, overlap_names) = parse::read_overlap_matrix(
+                &prefixes,
+                if opts.not_m_5_50 {
+                    None
+                } else {
+                    opts.frqfile.as_deref()
+                },
+                if opts.not_m_5_50 {
+                    None
+                } else {
+                    opts.frqfile_chr.as_deref()
+                },
+                chr_split,
+            )?;
+            anyhow::ensure!(
+                overlap_names.len() == l2_cols.len(),
+                "Overlap annotations (K={}) do not match LD score columns (K={})",
+                overlap_names.len(),
+                l2_cols.len()
+            );
+            overlap_enrichment = Some(compute_overlap_enrichment(&fit, &l2_cols, &overlap, m_tot)?);
+        }
+
+        let result = partitioned_result_from_fit(&fit, n_obs);
+        H2Estimate::Partitioned(result, l2_cols)
     } else {
         let ref_l2 = ref_l2_k.into_iter().next().unwrap();
         let m_snps = resolve_m(opts.m_snps, ref_ld_chr, opts.not_m_5_50, n_obs);
@@ -689,6 +748,7 @@ pub fn estimate_h2_from_files(
         estimate,
         n_snps: n_obs,
         liability_h2,
+        overlap_enrichment,
     })
 }
 
@@ -1504,6 +1564,34 @@ pub fn run_h2_ldsc_partitioned(
     fixed_intercept: Option<f64>,
 ) -> Result<PartitionedH2Result> {
     let n = col_len(chi2);
+    let fit = partitioned_h2_core_validated(
+        chi2,
+        ref_l2_k,
+        w_l2,
+        n_vec,
+        m_vec,
+        n_blocks,
+        fixed_intercept,
+    )?;
+    Ok(partitioned_result_from_fit(&fit, n))
+}
+
+/// Validates inputs (same rules as [`run_h2_ldsc_partitioned`]) and returns
+/// the raw fit rather than the public [`PartitionedH2Result`], for callers
+/// (the `--overlap-annot` path in [`estimate_h2_from_files`]) that need
+/// jackknife internals (`est`/`jknife_cov`/`delete_values`/`n_mean`) beyond
+/// what that public result type exposes.
+#[allow(clippy::too_many_arguments)]
+fn partitioned_h2_core_validated(
+    chi2: &ColF,
+    ref_l2_k: &[ColF],
+    w_l2: &ColF,
+    n_vec: &ColF,
+    m_vec: &[f64],
+    n_blocks: usize,
+    fixed_intercept: Option<f64>,
+) -> Result<PartitionedFit> {
+    let n = col_len(chi2);
     let k = ref_l2_k.len();
     anyhow::ensure!(n > 0, "run_h2_ldsc_partitioned: inputs must not be empty");
     anyhow::ensure!(k > 0, "run_h2_ldsc_partitioned: no L2 columns supplied");
@@ -1567,7 +1655,7 @@ pub fn run_h2_ldsc_partitioned(
         }
     }
 
-    let fit = partitioned_h2_core(
+    partitioned_h2_core(
         chi2,
         ref_l2_k,
         w_l2,
@@ -1575,8 +1663,15 @@ pub fn run_h2_ldsc_partitioned(
         m_vec.to_vec(),
         n_blocks,
         fixed_intercept,
-    )?;
+    )
+}
 
+/// Converts a raw [`PartitionedFit`] into the public, SE-annotated
+/// [`PartitionedH2Result`]. Whether the intercept was fixed is inferred
+/// from `fit.jknife_cov`'s size (`K` columns when fixed, `K+1` when free)
+/// rather than threaded through separately.
+fn partitioned_result_from_fit(fit: &PartitionedFit, n_snps: usize) -> PartitionedH2Result {
+    let k = fit.m_vec.len();
     let scale = fit.n_mean * fit.n_mean;
     let mut h2_per_annot_se = Vec::with_capacity(k);
     for (j, &m) in fit.m_vec.iter().enumerate() {
@@ -1589,22 +1684,22 @@ pub fn run_h2_ldsc_partitioned(
             tot_cov += fit.m_vec[i] * fit.m_vec[j] * fit.jknife_cov[(i, j)] / scale;
         }
     }
-    let intercept_se = if fixed_intercept.is_some() {
-        None
-    } else {
+    let intercept_se = if fit.jknife_cov.nrows() > k {
         Some(fit.jknife_cov[(k, k)].max(0.0).sqrt())
+    } else {
+        None
     };
 
-    Ok(PartitionedH2Result {
-        h2_per_annot: fit.h2_per_annot,
+    PartitionedH2Result {
+        h2_per_annot: fit.h2_per_annot.clone(),
         h2_per_annot_se,
         h2_total: fit.h2_total,
         h2_total_se: tot_cov.max(0.0).sqrt(),
         intercept: fit.intercept,
         intercept_se,
-        m_vec: fit.m_vec,
-        n_snps: n,
-    })
+        m_vec: fit.m_vec.clone(),
+        n_snps,
+    }
 }
 
 fn print_partitioned_summary(fit: &PartitionedFit, l2_cols: &[String], args: &H2Args) {
@@ -1641,14 +1736,36 @@ fn print_partitioned_summary(fit: &PartitionedFit, l2_cols: &[String], args: &H2
     }
 }
 
-fn write_overlap_results(
+/// Overlap-corrected partitioned-heritability enrichment (Finucane et al.
+/// 2015 `--overlap-annot`): the same math the `h2` CLI writes to
+/// `{out}.results`, as structured data. One entry per category, in
+/// `category_names` order.
+#[derive(Debug, Clone)]
+pub struct OverlapEnrichmentResult {
+    pub category_names: Vec<String>,
+    pub prop_m_overlap: Vec<f64>,
+    pub prop_h2_overlap: Vec<f64>,
+    pub prop_h2_overlap_se: Vec<f64>,
+    pub enrichment: Vec<f64>,
+    pub enrichment_se: Vec<f64>,
+    /// Two-sided p-value for the enrichment difference vs. all other
+    /// categories. `None` where its standard error is exactly zero (the
+    /// CLI's `.results` file prints "NA" there) — always the case for a
+    /// category whose M equals the total M.
+    pub enrichment_diff_p: Vec<Option<f64>>,
+    pub coefficient: Vec<f64>,
+    pub coefficient_se: Vec<f64>,
+}
+
+/// Pure computation core shared by [`write_overlap_results`] (CLI, formats
+/// and writes `{out}.results`) and the `--overlap-annot` path of
+/// [`estimate_h2_from_files`] (Python-facing, returns this struct directly).
+fn compute_overlap_enrichment(
     fit: &PartitionedFit,
     category_names: &[String],
     overlap: &MatF,
     m_tot: usize,
-    print_coefficients: bool,
-    out_prefix: &str,
-) -> Result<()> {
+) -> Result<OverlapEnrichmentResult> {
     let k = category_names.len();
     anyhow::ensure!(
         overlap.nrows() == k && overlap.ncols() == k,
@@ -1803,16 +1920,40 @@ fn write_overlap_results(
     }
     let tdist =
         StudentsT::new(0.0, 1.0, fit.n_blocks as f64).context("constructing t distribution")?;
-    let diff_p: Vec<String> = (0..k)
+    let enrichment_diff_p: Vec<Option<f64>> = (0..k)
         .map(|i| {
             if diff_se[(i, 0)] == 0.0 {
-                "NA".to_string()
+                None
             } else {
                 let t = (diff_est[(i, 0)] / diff_se[(i, 0)]).abs();
-                format!("{}", 2.0 * tdist.sf(t))
+                Some(2.0 * tdist.sf(t))
             }
         })
         .collect();
+
+    Ok(OverlapEnrichmentResult {
+        category_names: category_names.to_vec(),
+        prop_m_overlap,
+        prop_h2_overlap: (0..k).map(|i| prop_h2_overlap[(i, 0)]).collect(),
+        prop_h2_overlap_se: (0..k).map(|i| prop_h2_overlap_se[(i, 0)]).collect(),
+        enrichment,
+        enrichment_se,
+        enrichment_diff_p,
+        coefficient: (0..k).map(|i| coef[(i, 0)]).collect(),
+        coefficient_se: (0..k).map(|i| coef_se[(i, 0)]).collect(),
+    })
+}
+
+fn write_overlap_results(
+    fit: &PartitionedFit,
+    category_names: &[String],
+    overlap: &MatF,
+    m_tot: usize,
+    print_coefficients: bool,
+    out_prefix: &str,
+) -> Result<()> {
+    let r = compute_overlap_enrichment(fit, category_names, overlap, m_tot)?;
+    let k = r.category_names.len();
 
     let out_path = format!("{}.results", out_prefix);
     let mut w = BufWriter::new(
@@ -1833,37 +1974,40 @@ fn write_overlap_results(
     }
 
     for i in 0..k {
+        let diff_p = r.enrichment_diff_p[i]
+            .map(|p| format!("{}", p))
+            .unwrap_or_else(|| "NA".to_string());
         if print_coefficients {
-            let z = if coef_se[(i, 0)] == 0.0 {
+            let z = if r.coefficient_se[i] == 0.0 {
                 f64::NAN
             } else {
-                coef[(i, 0)] / coef_se[(i, 0)]
+                r.coefficient[i] / r.coefficient_se[i]
             };
             writeln!(
                 w,
                 "{}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{}\t{:.6e}\t{:.6e}\t{:.6}",
-                category_names[i],
-                prop_m_overlap[i],
-                prop_h2_overlap[(i, 0)],
-                prop_h2_overlap_se[(i, 0)],
-                enrichment[i],
-                enrichment_se[i],
-                diff_p[i],
-                coef[(i, 0)],
-                coef_se[(i, 0)],
+                r.category_names[i],
+                r.prop_m_overlap[i],
+                r.prop_h2_overlap[i],
+                r.prop_h2_overlap_se[i],
+                r.enrichment[i],
+                r.enrichment_se[i],
+                diff_p,
+                r.coefficient[i],
+                r.coefficient_se[i],
                 z
             )?;
         } else {
             writeln!(
                 w,
                 "{}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{}",
-                category_names[i],
-                prop_m_overlap[i],
-                prop_h2_overlap[(i, 0)],
-                prop_h2_overlap_se[(i, 0)],
-                enrichment[i],
-                enrichment_se[i],
-                diff_p[i]
+                r.category_names[i],
+                r.prop_m_overlap[i],
+                r.prop_h2_overlap[i],
+                r.prop_h2_overlap_se[i],
+                r.enrichment[i],
+                r.enrichment_se[i],
+                diff_p
             )?;
         }
     }

@@ -56,6 +56,21 @@ class NativeLdScoreResult:
     ld_score: List[float]
     maf: List[float]
     wall_seconds: float
+    l2_by_annot: Optional[List[List[float]]]
+    annot_names: Optional[List[str]]
+    m_vec: Optional[List[float]]
+    m_vec_5_50: Optional[List[float]]
+
+class NativeOverlapEnrichmentResult:
+    category_names: List[str]
+    prop_m_overlap: List[float]
+    prop_h2_overlap: List[float]
+    prop_h2_overlap_se: List[float]
+    enrichment: List[float]
+    enrichment_se: List[float]
+    enrichment_diff_p: List[Optional[float]]
+    coefficient: List[float]
+    coefficient_se: List[float]
 
 class NativeH2FileResult:
     h2: float
@@ -69,6 +84,7 @@ class NativeH2FileResult:
     h2_per_annot: Optional[List[float]]
     h2_per_annot_se: Optional[List[float]]
     m_vec: Optional[List[float]]
+    overlap_enrichment: Optional[NativeOverlapEnrichmentResult]
     n_snps: int
     liability_h2: Optional[float]
 
@@ -145,6 +161,8 @@ def compute_ld_scores_from_bytes(
 def estimate_ldscore(
     bfile: str,
     *,
+    annot: Optional[str] = ...,
+    thin_annot: bool = ...,
     window_unit: str = ...,
     window_value: float = ...,
     chunk_size: int = ...,
@@ -171,6 +189,9 @@ def estimate_h2(
     chisq_max: Optional[float] = ...,
     samp_prev: Optional[float] = ...,
     pop_prev: Optional[float] = ...,
+    overlap_annot: bool = ...,
+    frqfile: Optional[str] = ...,
+    frqfile_chr: Optional[str] = ...,
 ) -> NativeH2FileResult: ...
 
 def estimate_rg(

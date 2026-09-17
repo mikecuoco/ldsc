@@ -473,6 +473,8 @@ impl From<WireL2Config> for L2Config {
             yes_really: w.yes_really,
             pq_exp: w.pq_exp,
             verbose_timing: false,
+            annot: None,
+            annot_names: Vec::new(),
         }
     }
 }
@@ -903,15 +905,23 @@ pub async fn worker_compute_l2_chrs(
             n_snps_in,
         )));
     }
+    // No `--annot` support in the web demo — scalar (K==1) fields only,
+    // matching L2Output's own "length 1, identical to l2" convention.
+    let n_snps_out = accum_l2.len() as f64;
+    let n_well_imputed = accum_maf.iter().filter(|&&m| m > 0.05).count() as f64;
     let out = ldsc::l2::L2Output {
         snps: Vec::new(), // unused on the wire side
-        l2: accum_l2,
+        l2: accum_l2.clone(),
         maf: accum_maf,
         wall_seconds: total_wall_seconds,
         // Pool-level L2Output uses a default L2Perf because the
         // per-chr perfs were already accumulated into `accum_perf`
         // above (which goes out via `WireL2Output.perf` below).
         perf: ldsc::l2::L2Perf::default(),
+        l2_by_annot: vec![accum_l2],
+        annot_names: vec!["L2".to_string()],
+        m_vec: vec![n_snps_out],
+        m_vec_5_50: vec![n_well_imputed],
     };
 
     let wire = WireL2Output {

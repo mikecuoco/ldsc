@@ -154,6 +154,83 @@ def test_estimate_ldscore_matches_compute_ld_scores_from_bytes(tmp_path):
     assert from_file.ld_score == pytest.approx(from_bytes.ld_score)
 
 
+def test_estimate_ldscore_annot_partitioned(tmp_path):
+    bed = bytes([0x6C, 0x1B, 0x01, 0xF0, 0xF0])
+    bim = "1\trs1\t0\t100\tA\tG\n1\trs2\t0\t200\tA\tG\n"
+    fam = (
+        "F1\tI1\t0\t0\t1\t-9\n"
+        "F2\tI2\t0\t0\t1\t-9\n"
+        "F3\tI3\t0\t0\t1\t-9\n"
+        "F4\tI4\t0\t0\t1\t-9\n"
+    )
+    bfile = tmp_path / "micro"
+    bfile.with_suffix(".bed").write_bytes(bed)
+    bfile.with_suffix(".bim").write_text(bim)
+    bfile.with_suffix(".fam").write_text(fam)
+
+    annot_path = tmp_path / "micro.annot"
+    annot_path.write_text("catA\tcatB\n1\t0\n0\t1\n")
+
+    scalar = estimate_ldscore(str(bfile), window=("kb", 100.0), chunk_size=2)
+    partitioned = estimate_ldscore(
+        str(bfile),
+        annot=str(annot_path),
+        thin_annot=True,
+        window=("kb", 100.0),
+        chunk_size=2,
+    )
+
+    assert partitioned.annot_names == ("catA", "catB")
+    assert partitioned.l2_by_annot is not None
+    assert len(partitioned.l2_by_annot) == 2
+    # catA/catB partition all SNPs (one category each, disjoint, covering
+    # everything), so summing the two per-annotation LD score columns
+    # elementwise must recover the scalar (all-ones-annotation) LD score:
+    # l(j, i) = sum_k r^2_ik * a_kj, so sum_j l(j, i) = sum_k r^2_ik.
+    summed = [a + b for a, b in zip(partitioned.l2_by_annot[0], partitioned.l2_by_annot[1])]
+    assert summed == pytest.approx(scalar.ld_score)
+    assert partitioned.ld_score == pytest.approx(partitioned.l2_by_annot[0])
+    assert partitioned.m_values == pytest.approx((1.0, 1.0))
+    assert partitioned.m_values_5_50 == pytest.approx((1.0, 1.0))
+
+
+def test_estimate_ldscore_annot_rejects_row_mismatch(tmp_path):
+    bed = bytes([0x6C, 0x1B, 0x01, 0xF0, 0xF0])
+    bim = "1\trs1\t0\t100\tA\tG\n1\trs2\t0\t200\tA\tG\n"
+    fam = "F1\tI1\t0\t0\t1\t-9\n"
+    bfile = tmp_path / "micro"
+    bfile.with_suffix(".bed").write_bytes(bed)
+    bfile.with_suffix(".bim").write_text(bim)
+    bfile.with_suffix(".fam").write_text(fam)
+
+    annot_path = tmp_path / "micro.annot"
+    annot_path.write_text("catA\n1\n")  # only 1 row, BIM has 2 SNPs
+
+    with pytest.raises(ValueError, match="rows"):
+        estimate_ldscore(str(bfile), annot=str(annot_path), thin_annot=True)
+
+
+def test_estimate_ldscore_annot_conflicts_with_pq_exp(tmp_path):
+    bed = bytes([0x6C, 0x1B, 0x01, 0xF0, 0xF0])
+    bim = "1\trs1\t0\t100\tA\tG\n1\trs2\t0\t200\tA\tG\n"
+    fam = (
+        "F1\tI1\t0\t0\t1\t-9\n"
+        "F2\tI2\t0\t0\t1\t-9\n"
+        "F3\tI3\t0\t0\t1\t-9\n"
+        "F4\tI4\t0\t0\t1\t-9\n"
+    )
+    bfile = tmp_path / "micro"
+    bfile.with_suffix(".bed").write_bytes(bed)
+    bfile.with_suffix(".bim").write_text(bim)
+    bfile.with_suffix(".fam").write_text(fam)
+
+    annot_path = tmp_path / "micro.annot"
+    annot_path.write_text("catA\tcatB\n1\t0\n0\t1\n")
+
+    with pytest.raises(ValueError):
+        estimate_ldscore(str(bfile), annot=str(annot_path), thin_annot=True, pq_exp=0.25)
+
+
 def test_compute_ld_scores_rejects_truncated_bed():
     bed = bytes([0x6C, 0x1B, 0x01, 0xF0])
     bim = "1\trs1\t0\t100\tA\tG\n1\trs2\t0\t200\tA\tG\n"
@@ -388,3 +465,96 @@ def test_estimate_rg_matches_fit_rg(tmp_path):
 
     assert len(results) == 1
     assert results[0].correlation.value == pytest.approx(expected.correlation.value, abs=1e-6)
+
+
+def test_estimate_h2_overlap_annot_disjoint_categories_matches_naive(tmp_path):
+    n = 100
+    chi2, ref_ld, weight_ld, sample_size, _m_vec = synthetic_partitioned_h2_columns(n=n)
+    snps = [f"rs{i}" for i in range(n)]
+    z = [sqrt(v) for v in chi2]
+
+    sumstats_path = tmp_path / "trait.sumstats"
+    _write_lines(
+        sumstats_path,
+        ["SNP\tN\tZ"] + [f"{s}\t{nn}\t{zv}" for s, nn, zv in zip(snps, sample_size, z)],
+    )
+    ref_ld_path = tmp_path / "trait.l2.ldscore"
+    _write_lines(
+        ref_ld_path,
+        ["SNP\tL2A\tL2B"] + [f"{s}\t{a}\t{b}" for s, (a, b) in zip(snps, ref_ld)],
+    )
+    w_ld_path = tmp_path / "trait.w_ld.ldscore"
+    _write_lines(
+        w_ld_path,
+        ["SNP\tL2"] + [f"{s}\t{v}" for s, v in zip(snps, weight_ld)],
+    )
+    # Disjoint 50/50 annotation split, matching the uniform per-annotation
+    # M fallback `estimate_h2` uses without a `.l2.M`/`.l2.M_5_50` file
+    # (total_M / K each): the overlap matrix comes out diagonal with each
+    # category's M equal to the fit's own M, so overlap-corrected
+    # enrichment must reduce exactly to the naive (non-overlapping)
+    # prop_h2/prop_m formula — a hand-verifiable invariant that doesn't
+    # require re-deriving the general overlap-correction matrix algebra.
+    annot_path = tmp_path / "trait.l2.ldscore.annot"
+    annot_lines = ["CHR\tSNP\tBP\tCM\tCatA\tCatB"]
+    for i, s in enumerate(snps):
+        in_a = 1 if i < n // 2 else 0
+        annot_lines.append(f"1\t{s}\t{i}\t0\t{in_a}\t{1 - in_a}")
+    _write_lines(annot_path, annot_lines)
+
+    result = estimate_h2(
+        str(sumstats_path),
+        ref_ld=str(ref_ld_path),
+        w_ld=str(w_ld_path),
+        n_blocks=10,
+        not_m_5_50=True,  # skip the frqfile requirement
+        overlap_annot=True,
+    )
+
+    assert result.overlap_enrichment is not None
+    # Categories are labeled from the reference LD score columns (matching
+    # the CLI's `write_overlap_results`, which also names rows from
+    # `l2_cols` rather than the `.annot` file's own column names — only
+    # the column *count* is cross-checked against the annotation file).
+    assert [c.name for c in result.overlap_enrichment] == ["L2A", "L2B"]
+
+    h2_total = result.heritability.value
+    m_total = sum(result.m_values)
+    for i, cat in enumerate(result.overlap_enrichment):
+        naive_prop_h2 = result.per_annotation[i].value / h2_total
+        naive_prop_m = result.m_values[i] / m_total
+        assert cat.prop_snps == pytest.approx(naive_prop_m, abs=1e-9)
+        assert cat.prop_h2.value == pytest.approx(naive_prop_h2, abs=1e-6)
+        assert cat.enrichment.value == pytest.approx(naive_prop_h2 / naive_prop_m, abs=1e-6)
+
+
+def test_estimate_h2_overlap_annot_requires_frqfile_without_not_m_5_50(tmp_path):
+    n = 20
+    chi2, ref_ld, weight_ld, sample_size, _m_vec = synthetic_partitioned_h2_columns(n=n)
+    snps = [f"rs{i}" for i in range(n)]
+    z = [sqrt(v) for v in chi2]
+
+    sumstats_path = tmp_path / "trait.sumstats"
+    _write_lines(
+        sumstats_path,
+        ["SNP\tN\tZ"] + [f"{s}\t{nn}\t{zv}" for s, nn, zv in zip(snps, sample_size, z)],
+    )
+    ref_ld_path = tmp_path / "trait.l2.ldscore"
+    _write_lines(
+        ref_ld_path,
+        ["SNP\tL2A\tL2B"] + [f"{s}\t{a}\t{b}" for s, (a, b) in zip(snps, ref_ld)],
+    )
+    w_ld_path = tmp_path / "trait.w_ld.ldscore"
+    _write_lines(
+        w_ld_path,
+        ["SNP\tL2"] + [f"{s}\t{v}" for s, v in zip(snps, weight_ld)],
+    )
+
+    with pytest.raises(ValueError, match="frqfile"):
+        estimate_h2(
+            str(sumstats_path),
+            ref_ld=str(ref_ld_path),
+            w_ld=str(w_ld_path),
+            n_blocks=10,
+            overlap_annot=True,
+        )

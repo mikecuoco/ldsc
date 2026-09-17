@@ -50,6 +50,11 @@ class GeneticCorrelationResult:
 
 @dataclass(frozen=True)
 class LdScoreResult:
+    """Result of :func:`estimate_ldscore`/:func:`compute_ld_scores_from_bytes`.
+    `ld_score` is always the first annotation column (identical to the
+    scalar result when there was no `annot`). `l2_by_annot`/`annot_names`/
+    `m_values`/`m_values_5_50` are populated only when `annot` was given."""
+
     snp: tuple[str, ...]
     chromosome: tuple[int, ...]
     base_pair: tuple[int, ...]
@@ -57,6 +62,10 @@ class LdScoreResult:
     ld_score: tuple[float, ...]
     maf: tuple[float, ...]
     wall_seconds: float
+    l2_by_annot: Optional[tuple[tuple[float, ...], ...]] = None
+    annot_names: Optional[tuple[str, ...]] = None
+    m_values: Optional[tuple[float, ...]] = None
+    m_values_5_50: Optional[tuple[float, ...]] = None
 
 
 @dataclass(frozen=True)
@@ -71,10 +80,25 @@ class PartitionedHeritabilityResult:
 
 
 @dataclass(frozen=True)
+class OverlapEnrichmentCategory:
+    """One category's overlap-corrected enrichment (Finucane et al. 2015
+    `--overlap-annot`), as returned within :attr:`H2FileResult.overlap_enrichment`."""
+
+    name: str
+    prop_snps: float
+    prop_h2: Estimate
+    enrichment: Estimate
+    enrichment_diff_p: Optional[float]
+    coefficient: Estimate
+
+
+@dataclass(frozen=True)
 class H2FileResult:
     """Result of :func:`estimate_h2`. `per_annotation`/`l2_cols`/`m_values` are
     populated only when the loaded reference LD scores carried more than one
-    annotation column; otherwise `mean_chi2`/`lambda_gc`/`ratio` are."""
+    annotation column; otherwise `mean_chi2`/`lambda_gc`/`ratio` are.
+    `overlap_enrichment` is populated only when `overlap_annot=True` was
+    passed and the estimate was partitioned (K>1)."""
 
     heritability: Estimate
     intercept: Estimate
@@ -86,6 +110,7 @@ class H2FileResult:
     per_annotation: Optional[tuple[Estimate, ...]] = None
     m_values: Optional[tuple[float, ...]] = None
     liability_heritability: Optional[float] = None
+    overlap_enrichment: Optional[tuple[OverlapEnrichmentCategory, ...]] = None
 
 
 @dataclass(frozen=True)
@@ -287,6 +312,9 @@ def fit_rg_partitioned(
 
 
 def _ldscore_result(result: object) -> LdScoreResult:
+    l2_by_annot = None
+    if result.l2_by_annot is not None:
+        l2_by_annot = tuple(tuple(col) for col in result.l2_by_annot)
     return LdScoreResult(
         snp=tuple(result.snp),
         chromosome=tuple(result.chromosome),
@@ -295,6 +323,10 @@ def _ldscore_result(result: object) -> LdScoreResult:
         ld_score=tuple(result.ld_score),
         maf=tuple(result.maf),
         wall_seconds=result.wall_seconds,
+        l2_by_annot=l2_by_annot,
+        annot_names=tuple(result.annot_names) if result.annot_names is not None else None,
+        m_values=tuple(result.m_vec) if result.m_vec is not None else None,
+        m_values_5_50=tuple(result.m_vec_5_50) if result.m_vec_5_50 is not None else None,
     )
 
 
@@ -333,6 +365,8 @@ def compute_ld_scores_from_bytes(
 def estimate_ldscore(
     bfile: str,
     *,
+    annot: Optional[str] = None,
+    thin_annot: bool = False,
     window: Tuple[str, float] = ("kb", 1_000.0),
     chunk_size: int = 200,
     dtype: str = "float64",
@@ -344,13 +378,25 @@ def estimate_ldscore(
     """File-oriented, computation-only counterpart to the `l2` CLI subcommand.
 
     Reads `{bfile}.bed`/`.bim`/`.fam` (a PLINK `--bfile` prefix) from disk.
-    Scalar (K==1) only — matching :func:`compute_ld_scores_from_bytes`, no
-    `--extract`/`--keep`/`--annot` filtering.
+    No `--extract`/`--keep` filtering.
+
+    Pass `annot` (a `.annot`/`.annot.gz` path, or a prefix auto-resolved the
+    same way the CLI resolves a single-fileset `--annot`) for partitioned
+    (S-LDSC) LD scores — one column per annotation category, rows aligned
+    1:1 with the BIM. The result's `l2_by_annot`/`annot_names`/`m_values`/
+    `m_values_5_50` are then populated; `ld_score` stays the first
+    annotation's column for backward compatibility. Set `thin_annot=True`
+    if the annotation file has no CHR/SNP/BP/CM metadata columns.
+
+    Mutually exclusive with `pq_exp` (matching the CLI's per-chromosome
+    `--annot` usage, call this once per chromosome bfile/annot pair).
     """
     if len(window) != 2:
         raise ValueError("window must contain exactly (unit, value)")
     result = _native.estimate_ldscore(
         bfile,
+        annot=annot,
+        thin_annot=thin_annot,
         window_unit=window[0],
         window_value=window[1],
         chunk_size=chunk_size,
@@ -379,6 +425,9 @@ def estimate_h2(
     chisq_max: Optional[float] = None,
     samp_prev: Optional[float] = None,
     pop_prev: Optional[float] = None,
+    overlap_annot: bool = False,
+    frqfile: Optional[str] = None,
+    frqfile_chr: Optional[str] = None,
 ) -> H2FileResult:
     """File-oriented, computation-only counterpart to the `h2` CLI subcommand.
 
@@ -386,6 +435,13 @@ def estimate_h2(
     scalar (K==1) or partitioned (K>1) h2 depending on how many annotation
     columns the loaded reference LD scores carry. Exactly one of
     `ref_ld`/`ref_ld_chr` and one of `w_ld`/`w_ld_chr` must be given.
+
+    Pass `overlap_annot=True` for overlap-corrected enrichment (Finucane et
+    al. 2015 `--overlap-annot`), read from the `.annot[.gz|.bz2]` files at
+    the same location as `ref_ld`/`ref_ld_chr`. K>1 only. Unless
+    `not_m_5_50=True`, this also requires `frqfile` (with `ref_ld`) or
+    `frqfile_chr` (with `ref_ld_chr`) to restrict M-counts to
+    0.05 < MAF < 0.95, matching the CLI.
     """
     result = _native.estimate_h2(
         sumstats,
@@ -402,6 +458,9 @@ def estimate_h2(
         chisq_max=chisq_max,
         samp_prev=samp_prev,
         pop_prev=pop_prev,
+        overlap_annot=overlap_annot,
+        frqfile=frqfile,
+        frqfile_chr=frqfile_chr,
     )
     ratio = None if result.ratio is None else Estimate(result.ratio[0], result.ratio[1])
     per_annotation = None
@@ -409,6 +468,30 @@ def estimate_h2(
         per_annotation = tuple(
             Estimate(h, se)
             for h, se in zip(result.h2_per_annot, result.h2_per_annot_se)
+        )
+    overlap_enrichment = None
+    if result.overlap_enrichment is not None:
+        oe = result.overlap_enrichment
+        overlap_enrichment = tuple(
+            OverlapEnrichmentCategory(
+                name=name,
+                prop_snps=prop_snps,
+                prop_h2=Estimate(prop_h2, prop_h2_se),
+                enrichment=Estimate(enrichment, enrichment_se),
+                enrichment_diff_p=diff_p,
+                coefficient=Estimate(coef, coef_se),
+            )
+            for name, prop_snps, prop_h2, prop_h2_se, enrichment, enrichment_se, diff_p, coef, coef_se in zip(
+                oe.category_names,
+                oe.prop_m_overlap,
+                oe.prop_h2_overlap,
+                oe.prop_h2_overlap_se,
+                oe.enrichment,
+                oe.enrichment_se,
+                oe.enrichment_diff_p,
+                oe.coefficient,
+                oe.coefficient_se,
+            )
         )
     return H2FileResult(
         heritability=Estimate(result.h2, result.h2_se),
@@ -421,6 +504,7 @@ def estimate_h2(
         per_annotation=per_annotation,
         m_values=None if result.m_vec is None else tuple(result.m_vec),
         liability_heritability=result.liability_h2,
+        overlap_enrichment=overlap_enrichment,
     )
 
 
@@ -547,6 +631,7 @@ __all__ = [
     "HeritabilityResult",
     "LdScoreResult",
     "MungeSummary",
+    "OverlapEnrichmentCategory",
     "PartitionedHeritabilityResult",
     "compute_ld_scores_from_bytes",
     "estimate_h2",

@@ -30,8 +30,25 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     via `python/src/pyarray.rs`'s `FloatColumn`/`FloatMatrix`, avoiding
     PyO3's per-element Python-sequence extraction for large arrays.
   - See `python/README.md` for the full API and its scope relative to the
-    CLI (`--overlap-annot`/`--h2-cts`/jackknife-diagnostics printing are
-    out of scope).
+    CLI (`--h2-cts`/jackknife-diagnostics printing are out of scope).
+- **Python API: full S-LDSC support (`--annot` LD scores, `--overlap-annot`
+  enrichment).** Closes the two remaining gaps for running Stratified LDSC
+  from Python:
+  - `estimate_ldscore` gained `annot`/`thin_annot` for partitioned LD score
+    computation, matching `ldsc l2 --annot`. `L2Config`/`L2Output` (core
+    crate) gained `annot`/`annot_names` and `l2_by_annot`/`annot_names`/
+    `m_vec`/`m_vec_5_50` respectively; `compute_l2_from_bfile` gained
+    `annot`/`thin_annot` parameters. `LdScoreResult` gained
+    `l2_by_annot`/`annot_names`/`m_values`/`m_values_5_50`.
+  - `estimate_h2` gained `overlap_annot`/`frqfile`/`frqfile_chr` for
+    overlap-corrected enrichment (Finucane et al. 2015), matching
+    `ldsc h2 --overlap-annot`. The CLI's `write_overlap_results` (core
+    crate) was split into a pure `compute_overlap_enrichment` plus a thin
+    file-writing wrapper, so `estimate_h2`/`H2FileOptions` reuse the exact
+    same math via the new public `OverlapEnrichmentResult`.
+    `H2FileResult.overlap_enrichment` exposes one `OverlapEnrichmentCategory`
+    per annotation (`prop_snps`/`prop_h2`/`enrichment`/`enrichment_diff_p`/
+    `coefficient`).
 
 ## [0.5.0] — 2026-05-12
 

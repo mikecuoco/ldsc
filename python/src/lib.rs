@@ -139,6 +139,12 @@ struct NativeLdScoreResult {
     ld_score: Vec<f64>,
     maf: Vec<f64>,
     wall_seconds: f64,
+    // Partitioned (`--annot`) output. `None` for the scalar (K==1) path;
+    // `ld_score` above is always `l2_by_annot[0]` when this is `Some`.
+    l2_by_annot: Option<Vec<Vec<f64>>>,
+    annot_names: Option<Vec<String>>,
+    m_vec: Option<Vec<f64>>,
+    m_vec_5_50: Option<Vec<f64>>,
 }
 
 #[pyfunction]
@@ -433,10 +439,14 @@ fn build_l2_config(
         yes_really: true,
         pq_exp,
         verbose_timing: false,
+        annot: None,
+        annot_names: Vec::new(),
     })
 }
 
 fn ldscore_result(result: ldsc::l2::L2Output) -> NativeLdScoreResult {
+    // `--annot` was used iff there's more than one annotation column.
+    let partitioned = result.annot_names.len() > 1;
     NativeLdScoreResult {
         snp: result.snps.iter().map(|snp| snp.snp.clone()).collect(),
         chromosome: result.snps.iter().map(|snp| snp.chr).collect(),
@@ -445,6 +455,10 @@ fn ldscore_result(result: ldsc::l2::L2Output) -> NativeLdScoreResult {
         ld_score: result.l2,
         maf: result.maf,
         wall_seconds: result.wall_seconds,
+        l2_by_annot: partitioned.then(|| result.l2_by_annot.clone()),
+        annot_names: partitioned.then(|| result.annot_names.clone()),
+        m_vec: partitioned.then(|| result.m_vec.clone()),
+        m_vec_5_50: partitioned.then(|| result.m_vec_5_50.clone()),
     }
 }
 
@@ -494,13 +508,18 @@ fn compute_ld_scores_from_bytes(
     Ok(ldscore_result(result))
 }
 
-/// File-oriented, computation-only counterpart to `ldsc l2` (scalar, K==1
-/// only — no `--extract`/`--keep`/`--annot`). Reads `{bfile}.bed`/`.bim`/
-/// `.fam` from disk. See [`ldsc::l2::compute_l2_from_bfile`].
+/// File-oriented, computation-only counterpart to `ldsc l2` (no
+/// `--extract`/`--keep`). Reads `{bfile}.bed`/`.bim`/`.fam` from disk, and
+/// `annot`/`.annot.gz` when `annot` is given (matching the CLI's
+/// explicit-path or auto-resolved-single-fileset `--annot` usage — pass a
+/// per-chromosome `bfile`/`annot` pair to match real S-LDSC workflows).
+/// See [`ldsc::l2::compute_l2_from_bfile`].
 #[pyfunction]
 #[pyo3(signature = (
     bfile,
     *,
+    annot=None,
+    thin_annot=false,
     window_unit="kb",
     window_value=1000.0,
     chunk_size=200,
@@ -514,6 +533,8 @@ fn compute_ld_scores_from_bytes(
 fn estimate_ldscore(
     py: Python<'_>,
     bfile: String,
+    annot: Option<String>,
+    thin_annot: bool,
     window_unit: &str,
     window_value: f64,
     chunk_size: usize,
@@ -534,9 +555,41 @@ fn estimate_ldscore(
         pq_exp,
     )?;
     let result = py
-        .detach(move || compute_l2_from_bfile(&bfile, config))
+        .detach(move || compute_l2_from_bfile(&bfile, annot.as_deref(), thin_annot, config))
         .map_err(value_error)?;
     Ok(ldscore_result(result))
+}
+
+/// Overlap-corrected partitioned-heritability enrichment (Finucane et al.
+/// 2015 `--overlap-annot`). See [`ldsc::regressions::OverlapEnrichmentResult`].
+#[derive(Clone)]
+#[pyclass(frozen, get_all, module = "ldsc_rs._native", skip_from_py_object)]
+struct NativeOverlapEnrichmentResult {
+    category_names: Vec<String>,
+    prop_m_overlap: Vec<f64>,
+    prop_h2_overlap: Vec<f64>,
+    prop_h2_overlap_se: Vec<f64>,
+    enrichment: Vec<f64>,
+    enrichment_se: Vec<f64>,
+    enrichment_diff_p: Vec<Option<f64>>,
+    coefficient: Vec<f64>,
+    coefficient_se: Vec<f64>,
+}
+
+impl From<ldsc::regressions::OverlapEnrichmentResult> for NativeOverlapEnrichmentResult {
+    fn from(r: ldsc::regressions::OverlapEnrichmentResult) -> Self {
+        Self {
+            category_names: r.category_names,
+            prop_m_overlap: r.prop_m_overlap,
+            prop_h2_overlap: r.prop_h2_overlap,
+            prop_h2_overlap_se: r.prop_h2_overlap_se,
+            enrichment: r.enrichment,
+            enrichment_se: r.enrichment_se,
+            enrichment_diff_p: r.enrichment_diff_p,
+            coefficient: r.coefficient,
+            coefficient_se: r.coefficient_se,
+        }
+    }
 }
 
 /// File-oriented h2 result: fields are populated for the scalar (K==1)
@@ -557,6 +610,8 @@ struct NativeH2FileResult {
     h2_per_annot: Option<Vec<f64>>,
     h2_per_annot_se: Option<Vec<f64>>,
     m_vec: Option<Vec<f64>>,
+    // Partitioned (K>1) + `overlap_annot=True` only.
+    overlap_enrichment: Option<NativeOverlapEnrichmentResult>,
     // Always present.
     n_snps: usize,
     liability_h2: Option<f64>,
@@ -566,6 +621,9 @@ impl From<H2FileResult> for NativeH2FileResult {
     fn from(result: H2FileResult) -> Self {
         let liability_h2 = result.liability_h2;
         let n_snps = result.n_snps;
+        let overlap_enrichment = result
+            .overlap_enrichment
+            .map(NativeOverlapEnrichmentResult::from);
         match result.estimate {
             H2Estimate::Scalar(r) => Self {
                 h2: r.h2,
@@ -583,6 +641,7 @@ impl From<H2FileResult> for NativeH2FileResult {
                 h2_per_annot: None,
                 h2_per_annot_se: None,
                 m_vec: None,
+                overlap_enrichment,
                 n_snps,
                 liability_h2,
             },
@@ -598,6 +657,7 @@ impl From<H2FileResult> for NativeH2FileResult {
                 h2_per_annot: Some(p.h2_per_annot),
                 h2_per_annot_se: Some(p.h2_per_annot_se),
                 m_vec: Some(p.m_vec),
+                overlap_enrichment,
                 n_snps,
                 liability_h2,
             },
@@ -640,7 +700,10 @@ impl From<MungeSummary> for NativeMungeSummary {
     no_intercept=false,
     chisq_max=None,
     samp_prev=None,
-    pop_prev=None
+    pop_prev=None,
+    overlap_annot=false,
+    frqfile=None,
+    frqfile_chr=None
 ))]
 #[allow(clippy::too_many_arguments)]
 fn estimate_h2(
@@ -659,6 +722,9 @@ fn estimate_h2(
     chisq_max: Option<f64>,
     samp_prev: Option<f64>,
     pop_prev: Option<f64>,
+    overlap_annot: bool,
+    frqfile: Option<String>,
+    frqfile_chr: Option<String>,
 ) -> PyResult<NativeH2FileResult> {
     let opts = H2FileOptions {
         m_snps,
@@ -670,6 +736,9 @@ fn estimate_h2(
         chisq_max,
         samp_prev,
         pop_prev,
+        overlap_annot,
+        frqfile,
+        frqfile_chr,
     };
     let result = py
         .detach(move || {
@@ -859,6 +928,7 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<NativePartitionedH2Result>()?;
     module.add_class::<NativeRgResult>()?;
     module.add_class::<NativeLdScoreResult>()?;
+    module.add_class::<NativeOverlapEnrichmentResult>()?;
     module.add_class::<NativeH2FileResult>()?;
     module.add_class::<NativeMungeSummary>()?;
     module.add_function(wrap_pyfunction!(fit_h2, module)?)?;

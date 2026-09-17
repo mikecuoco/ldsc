@@ -10,9 +10,11 @@ genetic correlation computations to Python, in two layers:
   `estimate_ldscore`, `munge_sumstats`) take file paths, mirroring the
   `ldsc h2`/`rg`/`l2`/`munge-sumstats` CLI subcommands, and do the same
   loading, merging, and filtering — but return structured Python objects
-  instead of printing. They cover the CLI's core options; less common
-  flags such as `--overlap-annot`, `--h2-cts`, and jackknife-diagnostics
-  printing are out of scope for the Python API.
+  instead of printing. They cover the CLI's core options, including
+  stratified LD Score regression (S-LDSC): partitioned LD score computation
+  (`estimate_ldscore(..., annot=...)`) and overlap-corrected enrichment
+  (`estimate_h2(..., overlap_annot=True)`). `--h2-cts` and jackknife-
+  diagnostics printing remain out of scope for the Python API.
 
 ```python
 from ldsc_rs import fit_h2, estimate_h2
@@ -81,16 +83,41 @@ only skips the slow generic-sequence path on the way in.
 
 `estimate_ldscore(bfile, ...)` reads `{bfile}.bed`/`.bim`/`.fam` (a PLINK
 `--bfile` prefix) from disk and is otherwise identical to
-`compute_ld_scores_from_bytes` — same parameters (`window`, `chunk_size`,
-`dtype`, `sketch`, `sketch_maf_aware`, `snp_level_masking`, `pq_exp`), same
-scalar-only (K==1) scope, no `--extract`/`--keep`/`--annot` filtering.
+`compute_ld_scores_from_bytes` for the scalar (K==1) case — same parameters
+(`window`, `chunk_size`, `dtype`, `sketch`, `sketch_maf_aware`,
+`snp_level_masking`, `pq_exp`), no `--extract`/`--keep` filtering.
+
+Pass `annot=<path or prefix>` for partitioned (S-LDSC) LD scores — one
+column per annotation category, rows aligned 1:1 with the BIM (`thin_annot`
+selects the thin `.annot` format with no CHR/SNP/BP/CM metadata columns).
+The result's `l2_by_annot`/`annot_names`/`m_values`/`m_values_5_50` fields
+are then populated; `ld_score` stays the first annotation's column for
+backward compatibility with the scalar path. `annot` mirrors the CLI's
+`--annot` for a single fileset (an explicit path, or a prefix auto-resolved
+the same way): call `estimate_ldscore` once per chromosome for real S-LDSC
+workflows, just like `ldsc l2 --annot`. Mutually exclusive with `pq_exp`.
+
+## Stratified LD Score regression (S-LDSC)
+
+`estimate_h2(..., overlap_annot=True)` computes overlap-corrected
+enrichment (Finucane et al. 2015), matching the `h2` CLI's
+`--overlap-annot`. It requires a partitioned (K>1) fit and reads the
+`.annot[.gz|.bz2]` files at the same location as `ref_ld`/`ref_ld_chr`
+(one annotation file per chromosome for `ref_ld_chr`). Unless
+`not_m_5_50=True`, it also requires `frqfile` (with `ref_ld`) or
+`frqfile_chr` (with `ref_ld_chr`) to restrict M-counts to
+0.05 < MAF < 0.95, exactly like the CLI. Results land in
+`H2FileResult.overlap_enrichment`, a tuple of `OverlapEnrichmentCategory`
+(one per category, in reference-LD-score-column order): `prop_snps`,
+`prop_h2`, `enrichment` (each an `Estimate` where applicable),
+`enrichment_diff_p`, and `coefficient`.
 
 ## Scope and limitations
 
-- `--overlap-annot`, `--h2-cts`, and `--print-cov`/`--print-delete-vals`
-  (jackknife diagnostics) are CLI-only; not exposed here.
+- `--h2-cts` and `--print-cov`/`--print-delete-vals` (jackknife
+  diagnostics) are CLI-only; not exposed here.
 - `estimate_ldscore`/`compute_ld_scores_from_bytes` don't support
-  `--extract`/`--keep`/`--annot` filtering (K==1 only).
+  `--extract`/`--keep` filtering.
 - `estimate_rg` computes `sumstats[0]` against every other trait in
   `sumstats`, like `ldsc rg --rg a,b,c`, returning one result per pair in
   the same order as `sumstats[1:]`.

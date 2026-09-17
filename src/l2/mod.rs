@@ -965,10 +965,22 @@ pub struct L2Config {
     /// chromosome" safety check. In the browser we always have small
     /// inputs by design, so this is fine to default to `true`.
     pub yes_really: bool,
-    /// `--pq-exp` (or `Some(1.0)` for `--per-allele`).
+    /// `--pq-exp` (or `Some(1.0)` for `--per-allele`). Not supported
+    /// together with `annot` — see the field below.
     pub pq_exp: Option<f64>,
     /// `--verbose-timing`. Off in the browser; we render our own timing.
     pub verbose_timing: bool,
+    /// `--annot`: partitioned/stratified LD scores, one column per
+    /// annotation, rows aligned 1:1 with the BIM. `None` runs the
+    /// original scalar (K=1) path unchanged. Mutually exclusive with
+    /// `pq_exp` — the CLI's `--annot --pq-exp` combination pre-scales the
+    /// annotation matrix by a per-SNP MAF computed in an earlier prefilter
+    /// pass that this config shape doesn't have; unsupported here rather
+    /// than silently wrong.
+    pub annot: Option<MatF>,
+    /// Column names for `annot`, same length as `annot`'s column count.
+    /// Ignored when `annot` is `None`.
+    pub annot_names: Vec<String>,
 }
 
 impl Default for L2Config {
@@ -983,6 +995,8 @@ impl Default for L2Config {
             yes_really: true,
             pq_exp: None,
             verbose_timing: false,
+            annot: None,
+            annot_names: Vec::new(),
         }
     }
 }
@@ -992,6 +1006,8 @@ impl Default for L2Config {
 #[derive(Debug, Clone)]
 pub struct L2Output {
     pub snps: Vec<BimRecord>,
+    /// LD scores for the first (or only) annotation column. Kept for
+    /// scalar (K=1) callers; see `l2_by_annot` for the K-general form.
     pub l2: Vec<f64>,
     pub maf: Vec<f64>,
     pub wall_seconds: f64,
@@ -999,6 +1015,19 @@ pub struct L2Output {
     /// Always populated, regardless of `verbose_timing`. Consumers
     /// that don't want it can ignore the field.
     pub perf: L2Perf,
+    /// One `Vec<f64>` per annotation column, same order as `annot_names`.
+    /// Always populated (length 1, identical to `l2`, when there was no
+    /// `--annot`).
+    pub l2_by_annot: Vec<Vec<f64>>,
+    /// Names matching `l2_by_annot`'s outer index. `["L2"]` when there was
+    /// no `--annot`.
+    pub annot_names: Vec<String>,
+    /// Per-annotation M (sum of annotation values across all SNPs).
+    /// Single-element `[n_snps as f64]` when there was no `--annot`.
+    pub m_vec: Vec<f64>,
+    /// Same as `m_vec`, restricted to SNPs with MAF > 0.05 (matches the
+    /// CLI's `.l2.M_5_50` convention).
+    pub m_vec_5_50: Vec<f64>,
 }
 
 /// Per-phase wall-time breakdown of one `compute_ldscore_global` call.
@@ -1056,17 +1085,62 @@ pub fn compute_l2_from_bytes(
 }
 
 /// File-oriented, computation-only counterpart to `compute_l2_from_bytes`:
-/// reads `{bfile}.bed`/`.bim`/`.fam` from disk (a PLINK `--bfile` prefix)
-/// and drives the same single-annotation (`K = 1`) path, with no
-/// `--extract`/`--keep`/`--annot` filtering. This is the only file I/O —
-/// the rest is shared, already-tested code.
-pub fn compute_l2_from_bfile(bfile: &str, config: L2Config) -> Result<L2Output> {
+/// reads `{bfile}.bed`/`.bim`/`.fam` from disk (a PLINK `--bfile` prefix),
+/// with no `--extract`/`--keep` filtering. This is the only file I/O other
+/// than the optional annotation load below — the rest is shared,
+/// already-tested code.
+///
+/// `annot`, if given, is a path or prefix resolved the same way the `l2`
+/// CLI's `--annot` is: an explicit `.annot`/`.annot.gz`/`.annot.bz2` path,
+/// or a bare prefix resolved to whichever of those extensions exists.
+/// Drives the partitioned (K>1) path with one LD-score column per
+/// annotation; its rows must align 1:1 with `{bfile}.bim`. Does not
+/// support the CLI's per-chromosome-prefix `--annot` auto-loop (each call
+/// covers one chromosome's `--bfile`, matching real S-LDSC usage, which
+/// already calls `l2 --annot` once per chromosome).
+pub fn compute_l2_from_bfile(
+    bfile: &str,
+    annot: Option<&str>,
+    thin_annot: bool,
+    config: L2Config,
+) -> Result<L2Output> {
     let bed_bytes =
         std::fs::read(format!("{bfile}.bed")).with_context(|| format!("reading '{bfile}.bed'"))?;
     let bim_text = std::fs::read_to_string(format!("{bfile}.bim"))
         .with_context(|| format!("reading '{bfile}.bim'"))?;
     let fam_text = std::fs::read_to_string(format!("{bfile}.fam"))
         .with_context(|| format!("reading '{bfile}.fam'"))?;
+
+    let mut config = config;
+    if let Some(prefix_or_path) = annot {
+        anyhow::ensure!(
+            config.pq_exp.is_none(),
+            "compute_l2_from_bfile: annot and pq_exp cannot be combined in this API; \
+             use the `l2` CLI subcommand for per-allele-weighted partitioned LD scores"
+        );
+        let explicit = prefix_or_path.ends_with(".annot")
+            || prefix_or_path.ends_with(".annot.gz")
+            || prefix_or_path.ends_with(".annot.bz2");
+        let path = if explicit {
+            prefix_or_path.to_string()
+        } else {
+            parse::resolve_annot_path(prefix_or_path)?
+        };
+        let (mat, names) = parse::read_annot_path(&path, thin_annot)
+            .with_context(|| format!("reading annotation file '{}'", path))?;
+        let n_snps = parse_bim_str(&bim_text)
+            .context("parsing BIM for annot validation")?
+            .len();
+        anyhow::ensure!(
+            mat.nrows() == n_snps,
+            "Annotation file '{}' has {} rows but BIM has {} SNPs — they must match exactly",
+            path,
+            mat.nrows(),
+            n_snps
+        );
+        config.annot = Some(mat);
+        config.annot_names = names;
+    }
     compute_l2_from_bytes(bed_bytes, &bim_text, &fam_text, config)
 }
 
@@ -1144,6 +1218,29 @@ pub fn compute_l2_from_bed_with_progress(
 ) -> Result<L2Output> {
     anyhow::ensure!(!snps.is_empty(), "compute_l2_from_bed: BIM has zero SNPs");
     anyhow::ensure!(n_indiv > 0, "compute_l2_from_bed: FAM has zero individuals");
+    anyhow::ensure!(
+        config.annot.is_none() || config.pq_exp.is_none(),
+        "compute_l2_from_bed: annot and pq_exp cannot be combined in this API \
+         (the CLI's `l2 --annot --pq-exp` pre-scales the annotation matrix using \
+         a MAF prefilter pass this config shape doesn't have); use the `l2` CLI \
+         subcommand for per-allele-weighted partitioned LD scores"
+    );
+    if let Some(annot) = config.annot.as_ref() {
+        anyhow::ensure!(
+            annot.nrows() == snps.len(),
+            "compute_l2_from_bed: annotation matrix has {} rows but BIM has {} SNPs — \
+             they must match exactly",
+            annot.nrows(),
+            snps.len()
+        );
+        anyhow::ensure!(
+            config.annot_names.len() == annot.ncols(),
+            "compute_l2_from_bed: annot_names length {} does not match annotation \
+             column count {}",
+            config.annot_names.len(),
+            annot.ncols()
+        );
+    }
 
     let t0 = web_time::Instant::now();
     let (l2_mat, maf, perf) = compute_ldscore_global(
@@ -1153,7 +1250,7 @@ pub fn compute_l2_from_bed_with_progress(
         n_indiv,
         config.mode,
         config.chunk_size,
-        None, // no --annot in MVP
+        config.annot.as_ref(),
         None, // no --keep in MVP
         config.pq_exp,
         config.yes_really,
@@ -1170,9 +1267,37 @@ pub fn compute_l2_from_bed_with_progress(
     )
     .context("computing LD scores in compute_l2_from_bed")?;
 
-    // K = 1: collapse the (n × 1) matrix into a flat Vec<f64>.
-    debug_assert_eq!(l2_mat.ncols(), 1);
-    let l2: Vec<f64> = (0..l2_mat.nrows()).map(|i| l2_mat[(i, 0)]).collect();
+    let n_annot = l2_mat.ncols();
+    let l2_by_annot: Vec<Vec<f64>> = (0..n_annot)
+        .map(|j| (0..l2_mat.nrows()).map(|i| l2_mat[(i, j)]).collect())
+        .collect();
+    let annot_names = if config.annot.is_some() {
+        config.annot_names.clone()
+    } else {
+        vec!["L2".to_string()]
+    };
+    let l2 = l2_by_annot[0].clone();
+
+    let mut m_vec = vec![0.0f64; n_annot];
+    let mut m_vec_5_50 = vec![0.0f64; n_annot];
+    match config.annot.as_ref() {
+        Some(annot) => {
+            for i in 0..annot.nrows() {
+                let well_imputed = maf[i] > 0.05;
+                for j in 0..n_annot {
+                    let v = annot[(i, j)];
+                    m_vec[j] += v;
+                    if well_imputed {
+                        m_vec_5_50[j] += v;
+                    }
+                }
+            }
+        }
+        None => {
+            m_vec[0] = maf.len() as f64;
+            m_vec_5_50[0] = maf.iter().filter(|&&m| m > 0.05).count() as f64;
+        }
+    }
 
     Ok(L2Output {
         snps,
@@ -1180,6 +1305,10 @@ pub fn compute_l2_from_bed_with_progress(
         maf,
         wall_seconds: t0.elapsed().as_secs_f64(),
         perf,
+        l2_by_annot,
+        annot_names,
+        m_vec,
+        m_vec_5_50,
     })
 }
 
