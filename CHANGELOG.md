@@ -15,13 +15,17 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     `H2Result` gained optional per-annotation fields; a new
     `run_h2_ldsc_partitioned`/`PartitionedH2Result` reuses the `h2`
     subcommand's own regression exactly for CLI parity.
-  - `estimate_h2`/`estimate_rg`/`munge_sumstats` — file-oriented
-    counterparts to the `h2`/`rg`/`munge-sumstats` CLI subcommands: same
-    file loading, merging, and filtering, structured Python results
-    instead of stdout. Required splitting `run_h2`/`run_rg`/`munge::run`'s
-    file I/O from their pure computation in the core crate
-    (`estimate_h2_from_files`, `estimate_rg_from_files`,
-    `munge_sumstats_df`/`munge_sumstats_from_files`).
+  - `estimate_h2`/`estimate_rg`/`estimate_ldscore`/`munge_sumstats` —
+    file-oriented counterparts to the `h2`/`rg`/`l2`/`munge-sumstats` CLI
+    subcommands: same file loading, merging, and filtering, structured
+    Python results instead of stdout. Required splitting
+    `run_h2`/`run_rg`/`munge::run`'s file I/O from their pure computation
+    in the core crate (`estimate_h2_from_files`, `estimate_rg_from_files`,
+    `munge_sumstats_df`/`munge_sumstats_from_files`,
+    `compute_l2_from_bfile`). `estimate_h2` auto-dispatches between
+    scalar (K==1) and partitioned (K>1) based on the loaded LD scores;
+    `estimate_ldscore` is scalar-only, matching
+    `compute_ld_scores_from_bytes`.
   - Every numeric input (1-D and 2-D) now accepts a NumPy `float64` array,
     via `python/src/pyarray.rs`'s `FloatColumn`/`FloatMatrix`, avoiding
     PyO3's per-element Python-sequence extraction for large arrays.

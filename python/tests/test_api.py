@@ -10,6 +10,7 @@ import pytest
 from ldsc_rs import (
     compute_ld_scores_from_bytes,
     estimate_h2,
+    estimate_ldscore,
     estimate_rg,
     fit_h2,
     fit_h2_partitioned,
@@ -129,6 +130,28 @@ def test_compute_ld_scores_microbed():
     assert result.maf == pytest.approx((0.5, 0.5))
     assert result.ld_score == pytest.approx((2.0, 2.0))
     assert result.wall_seconds >= 0.0
+
+
+def test_estimate_ldscore_matches_compute_ld_scores_from_bytes(tmp_path):
+    bed = bytes([0x6C, 0x1B, 0x01, 0xF0, 0xF0])
+    bim = "1\trs1\t0\t100\tA\tG\n1\trs2\t0\t200\tA\tG\n"
+    fam = (
+        "F1\tI1\t0\t0\t1\t-9\n"
+        "F2\tI2\t0\t0\t1\t-9\n"
+        "F3\tI3\t0\t0\t1\t-9\n"
+        "F4\tI4\t0\t0\t1\t-9\n"
+    )
+    bfile = tmp_path / "micro"
+    bfile.with_suffix(".bed").write_bytes(bed)
+    bfile.with_suffix(".bim").write_text(bim)
+    bfile.with_suffix(".fam").write_text(fam)
+
+    from_bytes = compute_ld_scores_from_bytes(bed, bim, fam, window=("kb", 100.0), chunk_size=2)
+    from_file = estimate_ldscore(str(bfile), window=("kb", 100.0), chunk_size=2)
+
+    assert from_file.snp == from_bytes.snp
+    assert from_file.maf == pytest.approx(from_bytes.maf)
+    assert from_file.ld_score == pytest.approx(from_bytes.ld_score)
 
 
 def test_compute_ld_scores_rejects_truncated_bed():

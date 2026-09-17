@@ -7,12 +7,12 @@ genetic correlation computations to Python, in two layers:
   `fit_rg_partitioned`, `compute_ld_scores_from_bytes`) take already-loaded,
   already-harmonised columns and do no file I/O.
 - **File-oriented functions** (`estimate_h2`, `estimate_rg`,
-  `munge_sumstats`) take file paths, mirroring the `ldsc h2`/`rg`/
-  `munge-sumstats` CLI subcommands, and do the same loading, merging, and
-  filtering — but return structured Python objects instead of printing.
-  They cover the CLI's core options; less common flags such as
-  `--overlap-annot`, `--h2-cts`, and jackknife-diagnostics printing are out
-  of scope for the Python API.
+  `estimate_ldscore`, `munge_sumstats`) take file paths, mirroring the
+  `ldsc h2`/`rg`/`l2`/`munge-sumstats` CLI subcommands, and do the same
+  loading, merging, and filtering — but return structured Python objects
+  instead of printing. They cover the CLI's core options; less common
+  flags such as `--overlap-annot`, `--h2-cts`, and jackknife-diagnostics
+  printing are out of scope for the Python API.
 
 ```python
 from ldsc_rs import fit_h2, estimate_h2
@@ -77,10 +77,20 @@ meaningfully faster for large arrays (whole-genome LD-score columns, up to
 zero-copy — the underlying linear-algebra type always owns its buffer — it
 only skips the slow generic-sequence path on the way in.
 
+## LD score computation from files
+
+`estimate_ldscore(bfile, ...)` reads `{bfile}.bed`/`.bim`/`.fam` (a PLINK
+`--bfile` prefix) from disk and is otherwise identical to
+`compute_ld_scores_from_bytes` — same parameters (`window`, `chunk_size`,
+`dtype`, `sketch`, `sketch_maf_aware`, `snp_level_masking`, `pq_exp`), same
+scalar-only (K==1) scope, no `--extract`/`--keep`/`--annot` filtering.
+
 ## Scope and limitations
 
 - `--overlap-annot`, `--h2-cts`, and `--print-cov`/`--print-delete-vals`
   (jackknife diagnostics) are CLI-only; not exposed here.
+- `estimate_ldscore`/`compute_ld_scores_from_bytes` don't support
+  `--extract`/`--keep`/`--annot` filtering (K==1 only).
 - `estimate_rg` computes `sumstats[0]` against every other trait in
   `sumstats`, like `ldsc rg --rg a,b,c`, returning one result per pair in
   the same order as `sumstats[1:]`.

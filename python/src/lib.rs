@@ -1,7 +1,7 @@
 mod pyarray;
 
 use ldsc::h2::{H2Result, run_h2_ldsc};
-use ldsc::l2::{L2Config, WindowMode, compute_l2_from_bytes};
+use ldsc::l2::{L2Config, WindowMode, compute_l2_from_bfile, compute_l2_from_bytes};
 use ldsc::la::col_from_vec;
 use ldsc::munge::{MungeOptions, MungeSummary, munge_sumstats_from_files};
 use ldsc::regressions::{
@@ -388,6 +388,66 @@ fn fit_rg_partitioned<'py>(
     Ok(result.into())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn build_l2_config(
+    window_unit: &str,
+    window_value: f64,
+    chunk_size: usize,
+    dtype: &str,
+    sketch: Option<usize>,
+    sketch_maf_aware: bool,
+    snp_level_masking: bool,
+    pq_exp: Option<f64>,
+) -> PyResult<L2Config> {
+    if !window_value.is_finite() || window_value <= 0.0 {
+        return Err(value_error("window value must be finite and > 0"));
+    }
+    if chunk_size == 0 {
+        return Err(value_error("chunk_size must be > 0"));
+    }
+    let mode = match window_unit {
+        "cm" => WindowMode::Cm(window_value),
+        "kb" => WindowMode::Kb(window_value),
+        "snps" if window_value.fract() == 0.0 => WindowMode::Snp(window_value as usize),
+        "snps" => return Err(value_error("SNP window value must be an integer")),
+        _ => return Err(value_error("window unit must be 'cm', 'kb', or 'snps'")),
+    };
+    let use_f32 = match dtype {
+        "float64" => false,
+        "float32" => true,
+        _ => return Err(value_error("dtype must be 'float64' or 'float32'")),
+    };
+    if sketch_maf_aware && sketch.is_none() {
+        return Err(value_error("sketch_maf_aware requires sketch"));
+    }
+    if sketch == Some(0) {
+        return Err(value_error("sketch dimension must be > 0"));
+    }
+    Ok(L2Config {
+        mode,
+        chunk_size,
+        use_f32,
+        sketch,
+        sketch_maf_aware,
+        snp_level_masking,
+        yes_really: true,
+        pq_exp,
+        verbose_timing: false,
+    })
+}
+
+fn ldscore_result(result: ldsc::l2::L2Output) -> NativeLdScoreResult {
+    NativeLdScoreResult {
+        snp: result.snps.iter().map(|snp| snp.snp.clone()).collect(),
+        chromosome: result.snps.iter().map(|snp| snp.chr).collect(),
+        base_pair: result.snps.iter().map(|snp| snp.bp).collect(),
+        centimorgan: result.snps.iter().map(|snp| snp.cm).collect(),
+        ld_score: result.l2,
+        maf: result.maf,
+        wall_seconds: result.wall_seconds,
+    }
+}
+
 #[pyfunction]
 #[pyo3(signature = (
     bed,
@@ -417,61 +477,66 @@ fn compute_ld_scores_from_bytes(
     snp_level_masking: bool,
     pq_exp: Option<f64>,
 ) -> PyResult<NativeLdScoreResult> {
-    if !window_value.is_finite() || window_value <= 0.0 {
-        return Err(value_error("window value must be finite and > 0"));
-    }
-    if chunk_size == 0 {
-        return Err(value_error("chunk_size must be > 0"));
-    }
-    let mode = match window_unit {
-        "cm" => WindowMode::Cm(window_value),
-        "kb" => WindowMode::Kb(window_value),
-        "snps" if window_value.fract() == 0.0 => WindowMode::Snp(window_value as usize),
-        "snps" => return Err(value_error("SNP window value must be an integer")),
-        _ => return Err(value_error("window unit must be 'cm', 'kb', or 'snps'")),
-    };
-    let use_f32 = match dtype {
-        "float64" => false,
-        "float32" => true,
-        _ => return Err(value_error("dtype must be 'float64' or 'float32'")),
-    };
-    if sketch_maf_aware && sketch.is_none() {
-        return Err(value_error("sketch_maf_aware requires sketch"));
-    }
-    if sketch == Some(0) {
-        return Err(value_error("sketch dimension must be > 0"));
-    }
+    let config = build_l2_config(
+        window_unit,
+        window_value,
+        chunk_size,
+        dtype,
+        sketch,
+        sketch_maf_aware,
+        snp_level_masking,
+        pq_exp,
+    )?;
     let bed = bed.as_bytes().to_vec();
     let result = py
-        .detach(move || {
-            compute_l2_from_bytes(
-                bed,
-                &bim,
-                &fam,
-                L2Config {
-                    mode,
-                    chunk_size,
-                    use_f32,
-                    sketch,
-                    sketch_maf_aware,
-                    snp_level_masking,
-                    yes_really: true,
-                    pq_exp,
-                    verbose_timing: false,
-                },
-            )
-        })
+        .detach(move || compute_l2_from_bytes(bed, &bim, &fam, config))
         .map_err(value_error)?;
+    Ok(ldscore_result(result))
+}
 
-    Ok(NativeLdScoreResult {
-        snp: result.snps.iter().map(|snp| snp.snp.clone()).collect(),
-        chromosome: result.snps.iter().map(|snp| snp.chr).collect(),
-        base_pair: result.snps.iter().map(|snp| snp.bp).collect(),
-        centimorgan: result.snps.iter().map(|snp| snp.cm).collect(),
-        ld_score: result.l2,
-        maf: result.maf,
-        wall_seconds: result.wall_seconds,
-    })
+/// File-oriented, computation-only counterpart to `ldsc l2` (scalar, K==1
+/// only — no `--extract`/`--keep`/`--annot`). Reads `{bfile}.bed`/`.bim`/
+/// `.fam` from disk. See [`ldsc::l2::compute_l2_from_bfile`].
+#[pyfunction]
+#[pyo3(signature = (
+    bfile,
+    *,
+    window_unit="kb",
+    window_value=1000.0,
+    chunk_size=200,
+    dtype="float64",
+    sketch=None,
+    sketch_maf_aware=false,
+    snp_level_masking=false,
+    pq_exp=None
+))]
+#[allow(clippy::too_many_arguments)]
+fn estimate_ldscore(
+    py: Python<'_>,
+    bfile: String,
+    window_unit: &str,
+    window_value: f64,
+    chunk_size: usize,
+    dtype: &str,
+    sketch: Option<usize>,
+    sketch_maf_aware: bool,
+    snp_level_masking: bool,
+    pq_exp: Option<f64>,
+) -> PyResult<NativeLdScoreResult> {
+    let config = build_l2_config(
+        window_unit,
+        window_value,
+        chunk_size,
+        dtype,
+        sketch,
+        sketch_maf_aware,
+        snp_level_masking,
+        pq_exp,
+    )?;
+    let result = py
+        .detach(move || compute_l2_from_bfile(&bfile, config))
+        .map_err(value_error)?;
+    Ok(ldscore_result(result))
 }
 
 /// File-oriented h2 result: fields are populated for the scalar (K==1)
@@ -801,6 +866,7 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(fit_rg, module)?)?;
     module.add_function(wrap_pyfunction!(fit_rg_partitioned, module)?)?;
     module.add_function(wrap_pyfunction!(compute_ld_scores_from_bytes, module)?)?;
+    module.add_function(wrap_pyfunction!(estimate_ldscore, module)?)?;
     module.add_function(wrap_pyfunction!(estimate_h2, module)?)?;
     module.add_function(wrap_pyfunction!(estimate_rg, module)?)?;
     module.add_function(wrap_pyfunction!(munge_sumstats, module)?)?;

@@ -286,6 +286,18 @@ def fit_rg_partitioned(
     return _rg_result(result)
 
 
+def _ldscore_result(result: object) -> LdScoreResult:
+    return LdScoreResult(
+        snp=tuple(result.snp),
+        chromosome=tuple(result.chromosome),
+        base_pair=tuple(result.base_pair),
+        centimorgan=tuple(result.centimorgan),
+        ld_score=tuple(result.ld_score),
+        maf=tuple(result.maf),
+        wall_seconds=result.wall_seconds,
+    )
+
+
 def compute_ld_scores_from_bytes(
     bed: bytes,
     bim: str,
@@ -315,15 +327,40 @@ def compute_ld_scores_from_bytes(
         snp_level_masking,
         pq_exp,
     )
-    return LdScoreResult(
-        snp=tuple(result.snp),
-        chromosome=tuple(result.chromosome),
-        base_pair=tuple(result.base_pair),
-        centimorgan=tuple(result.centimorgan),
-        ld_score=tuple(result.ld_score),
-        maf=tuple(result.maf),
-        wall_seconds=result.wall_seconds,
+    return _ldscore_result(result)
+
+
+def estimate_ldscore(
+    bfile: str,
+    *,
+    window: Tuple[str, float] = ("kb", 1_000.0),
+    chunk_size: int = 200,
+    dtype: str = "float64",
+    sketch: Optional[int] = None,
+    sketch_maf_aware: bool = False,
+    snp_level_masking: bool = False,
+    pq_exp: Optional[float] = None,
+) -> LdScoreResult:
+    """File-oriented, computation-only counterpart to the `l2` CLI subcommand.
+
+    Reads `{bfile}.bed`/`.bim`/`.fam` (a PLINK `--bfile` prefix) from disk.
+    Scalar (K==1) only — matching :func:`compute_ld_scores_from_bytes`, no
+    `--extract`/`--keep`/`--annot` filtering.
+    """
+    if len(window) != 2:
+        raise ValueError("window must contain exactly (unit, value)")
+    result = _native.estimate_ldscore(
+        bfile,
+        window_unit=window[0],
+        window_value=window[1],
+        chunk_size=chunk_size,
+        dtype=dtype,
+        sketch=sketch,
+        sketch_maf_aware=sketch_maf_aware,
+        snp_level_masking=snp_level_masking,
+        pq_exp=pq_exp,
     )
+    return _ldscore_result(result)
 
 
 def estimate_h2(
@@ -513,6 +550,7 @@ __all__ = [
     "PartitionedHeritabilityResult",
     "compute_ld_scores_from_bytes",
     "estimate_h2",
+    "estimate_ldscore",
     "estimate_rg",
     "fit_h2",
     "fit_h2_partitioned",

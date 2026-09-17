@@ -142,6 +142,19 @@ def compute_ld_scores_from_bytes(
     pq_exp: Optional[float] = ...,
 ) -> NativeLdScoreResult: ...
 
+def estimate_ldscore(
+    bfile: str,
+    *,
+    window_unit: str = ...,
+    window_value: float = ...,
+    chunk_size: int = ...,
+    dtype: str = ...,
+    sketch: Optional[int] = ...,
+    sketch_maf_aware: bool = ...,
+    snp_level_masking: bool = ...,
+    pq_exp: Optional[float] = ...,
+) -> NativeLdScoreResult: ...
+
 def estimate_h2(
     sumstats: str,
     *,
