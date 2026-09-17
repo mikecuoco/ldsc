@@ -110,6 +110,26 @@ Local install options:
 - Prebuilt binaries from GitHub Releases (see [Prebuilt Binaries](#prebuilt-binaries) below).
 - Cargo install (requires Rust ≥ 1.85): `cargo install ldsc`
 
+### Experimental Python API
+
+The `python/` workspace package provides native PyO3 bindings to the same Rust
+numerical core used by the CLI and web application:
+
+```bash
+cd python
+maturin develop
+```
+
+```python
+from ldsc_rs import compute_ld_scores_from_bytes, fit_h2, fit_rg
+```
+
+The initial API is computation-only: `fit_h2` and `fit_rg` accept aligned
+in-memory columns, while `compute_ld_scores_from_bytes` accepts PLINK BED bytes
+and BIM/FAM text. Results are immutable dataclasses. File-oriented munging,
+harmonisation, and partitioned analyses remain available through the CLI until
+their I/O and presentation layers are separated from computation.
+
 ## Quick Start
 
 Two common workflows. Both produce numerically identical h²/rg output to

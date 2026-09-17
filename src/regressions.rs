@@ -14,8 +14,8 @@ use std::io::{BufWriter, Write};
 
 use crate::cli::{H2Args, RgArgs};
 use crate::h2::{
-    JackknifeResult, aggregate, combine_twostep, irwls_ldsc, jackknife_fast, ldsc_weights,
-    run_h2_ldsc, update_separators, weight_xy,
+    H2Result, JackknifeResult, aggregate, combine_twostep, irwls_ldsc, jackknife_fast,
+    ldsc_weights, run_h2_ldsc, update_separators, weight_xy,
 };
 use crate::irwls::IrwlsResult;
 use crate::parse;
@@ -1549,6 +1549,44 @@ struct GencovFit {
     tot_delete_values: ColF,
 }
 
+/// Structured genetic-covariance estimate returned by [`run_rg_ldsc`].
+#[derive(Debug, Clone)]
+pub struct GeneticCovarianceResult {
+    pub covariance: f64,
+    pub covariance_se: f64,
+    pub intercept: f64,
+    pub intercept_se: f64,
+    pub mean_z1z2: f64,
+}
+
+/// Structured, in-memory bivariate LD Score regression result.
+///
+/// This is the computation-only counterpart to the file-oriented `rg` CLI.
+/// Inputs must already be SNP-aligned and allele-harmonised.
+#[derive(Debug, Clone)]
+pub struct GeneticCorrelationResult {
+    pub h2_1: H2Result,
+    pub h2_2: H2Result,
+    pub genetic_covariance: GeneticCovarianceResult,
+    pub rg: f64,
+    pub rg_se: f64,
+    pub z: f64,
+    pub p: f64,
+    pub n_snps: usize,
+}
+
+fn hsq_result(fit: &HsqFit) -> H2Result {
+    H2Result {
+        h2: fit.tot,
+        h2_se: fit.tot_se,
+        intercept: fit.intercept,
+        intercept_se: fit.intercept_se,
+        mean_chi2: fit.mean_chi2,
+        lambda_gc: fit.lambda_gc,
+        ratio: fit.ratio,
+    }
+}
+
 fn sum_ref_l2(ref_l2_k: &[ColF]) -> Result<ColF> {
     anyhow::ensure!(!ref_l2_k.is_empty(), "No L2 columns supplied");
     let n = col_len(&ref_l2_k[0]);
@@ -2048,6 +2086,171 @@ fn run_gencov_ldsc(
         intercept_se,
         mean_z1z2,
         tot_delete_values,
+    })
+}
+
+/// Run bivariate LD Score regression on aligned in-memory columns.
+///
+/// Unlike [`run_rg`], this function performs no file I/O and emits no CLI
+/// output. The caller is responsible for joining SNPs and aligning alleles.
+#[allow(clippy::too_many_arguments)]
+pub fn run_rg_ldsc(
+    z1: &ColF,
+    z2: &ColF,
+    ref_l2: &ColF,
+    w_l2: &ColF,
+    n1: &ColF,
+    n2: &ColF,
+    m_snps: f64,
+    n_blocks: usize,
+    two_step: Option<f64>,
+    intercept_h2_1: Option<f64>,
+    intercept_h2_2: Option<f64>,
+    intercept_gencov: Option<f64>,
+) -> Result<GeneticCorrelationResult> {
+    let n = col_len(z1);
+    anyhow::ensure!(n > 0, "run_rg_ldsc: inputs must not be empty");
+    anyhow::ensure!(
+        col_len(z2) == n
+            && col_len(ref_l2) == n
+            && col_len(w_l2) == n
+            && col_len(n1) == n
+            && col_len(n2) == n,
+        "run_rg_ldsc: input length mismatch"
+    );
+    anyhow::ensure!(
+        m_snps.is_finite() && m_snps > 0.0,
+        "run_rg_ldsc: m_snps must be finite and > 0"
+    );
+    anyhow::ensure!(n_blocks > 1, "run_rg_ldsc: n_blocks must be > 1");
+    let n_blocks = n_blocks.min(n);
+    anyhow::ensure!(
+        n_blocks > 1,
+        "run_rg_ldsc: at least two observations are required"
+    );
+    anyhow::ensure!(
+        two_step.is_none_or(f64::is_finite)
+            && intercept_h2_1.is_none_or(f64::is_finite)
+            && intercept_h2_2.is_none_or(f64::is_finite)
+            && intercept_gencov.is_none_or(f64::is_finite),
+        "run_rg_ldsc: estimator parameters must be finite"
+    );
+    for i in 0..n {
+        anyhow::ensure!(
+            z1[(i, 0)].is_finite()
+                && z2[(i, 0)].is_finite()
+                && ref_l2[(i, 0)].is_finite()
+                && w_l2[(i, 0)].is_finite()
+                && n1[(i, 0)].is_finite()
+                && n2[(i, 0)].is_finite(),
+            "run_rg_ldsc: all inputs must be finite"
+        );
+        anyhow::ensure!(
+            ref_l2[(i, 0)] >= 0.0 && w_l2[(i, 0)] >= 0.0,
+            "run_rg_ldsc: LD scores must be non-negative"
+        );
+        anyhow::ensure!(
+            n1[(i, 0)] > 0.0 && n2[(i, 0)] > 0.0,
+            "run_rg_ldsc: sample sizes must be > 0"
+        );
+    }
+    let ref_l2_k = [ref_l2.clone()];
+    let m_vec = [m_snps];
+
+    let mut z1_sq = col_zeros(n);
+    let mut z2_sq = col_zeros(n);
+    for i in 0..n {
+        z1_sq[(i, 0)] = z1[(i, 0)].powi(2);
+        z2_sq[(i, 0)] = z2[(i, 0)].powi(2);
+    }
+
+    let hsq1 = run_hsq_ldsc(
+        &z1_sq,
+        &ref_l2_k,
+        w_l2,
+        n1,
+        &m_vec,
+        n_blocks,
+        two_step,
+        intercept_h2_1,
+    )?;
+    let hsq2 = run_hsq_ldsc(
+        &z2_sq,
+        &ref_l2_k,
+        w_l2,
+        n2,
+        &m_vec,
+        n_blocks,
+        two_step,
+        intercept_h2_2,
+    )?;
+    let gencov = run_gencov_ldsc(
+        z1,
+        z2,
+        &ref_l2_k,
+        w_l2,
+        n1,
+        n2,
+        &m_vec,
+        n_blocks,
+        two_step,
+        intercept_gencov,
+        &hsq1,
+        &hsq2,
+    )?;
+
+    let (rg, rg_se) = if hsq1.tot > 0.0 && hsq2.tot > 0.0 {
+        let rg = gencov.tot / (hsq1.tot * hsq2.tot).sqrt();
+        let mut numer_delete = mat_zeros(n_blocks, 1);
+        let mut denom_delete = mat_zeros(n_blocks, 1);
+        for block in 0..n_blocks {
+            numer_delete[(block, 0)] = gencov.tot_delete_values[(block, 0)];
+            let product = hsq1.tot_delete_values[(block, 0)] * hsq2.tot_delete_values[(block, 0)];
+            denom_delete[(block, 0)] = if product.is_finite() && product >= 0.0 {
+                product.sqrt()
+            } else {
+                f64::NAN
+            };
+        }
+        let estimate = col_from_vec(vec![rg]);
+        let (_, se) = ratio_jackknife(&estimate, &numer_delete, &denom_delete);
+        (rg, se[(0, 0)])
+    } else {
+        (f64::NAN, f64::NAN)
+    };
+
+    let (z, p) = if !rg.is_finite() || !rg_se.is_finite() {
+        (f64::NAN, f64::NAN)
+    } else if rg_se != 0.0 {
+        let z = rg / rg_se;
+        let p = if z.is_finite() {
+            let chi2_dist = ChiSquared::new(1.0).expect("valid chi-squared degrees of freedom");
+            1.0 - chi2_dist.cdf(z * z)
+        } else {
+            0.0
+        };
+        (z, p)
+    } else if rg == 0.0 {
+        (f64::NAN, f64::NAN)
+    } else {
+        (rg.signum() * f64::INFINITY, 0.0)
+    };
+
+    Ok(GeneticCorrelationResult {
+        h2_1: hsq_result(&hsq1),
+        h2_2: hsq_result(&hsq2),
+        genetic_covariance: GeneticCovarianceResult {
+            covariance: gencov.tot,
+            covariance_se: gencov.tot_se,
+            intercept: gencov.intercept,
+            intercept_se: gencov.intercept_se,
+            mean_z1z2: gencov.mean_z1z2,
+        },
+        rg,
+        rg_se,
+        z,
+        p,
+        n_snps: n,
     })
 }
 
