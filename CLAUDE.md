@@ -26,7 +26,7 @@ cargo build --release          # Always use release; debug is too slow
 cargo check                    # Quick type-check
 cargo clippy --release -- -D warnings   # Lint (CI enforces zero warnings)
 cargo fmt --check              # Format check
-cargo test --release           # Unit tests (no inline tests currently; this runs doc tests)
+cargo test --release           # Unit + doc tests
 bash test_rust.sh --build      # Integration smoke tests (needs data/1000G_phase3_common_norel.{bed,bim,fam})
 ```
 

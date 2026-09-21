@@ -1628,8 +1628,8 @@ fn partitioned_h2_core_validated(
     );
     for &m in m_vec {
         anyhow::ensure!(
-            m.is_finite() && m > 0.0,
-            "run_h2_ldsc_partitioned: each M value must be finite and > 0"
+            m.is_finite() && m != 0.0,
+            "run_h2_ldsc_partitioned: each M value must be finite and non-zero"
         );
     }
     anyhow::ensure!(
@@ -2283,8 +2283,8 @@ pub fn run_hsq_ldsc(
     );
     for &m in m_vec {
         anyhow::ensure!(
-            m.is_finite() && m > 0.0,
-            "run_hsq_ldsc: each M value must be finite and > 0"
+            m.is_finite() && m != 0.0,
+            "run_hsq_ldsc: each M value must be finite and non-zero"
         );
     }
     anyhow::ensure!(n_blocks > 1, "run_hsq_ldsc: n_blocks must be > 1");
@@ -2767,8 +2767,8 @@ pub fn run_rg_ldsc(
     }
     for &m in m_vec {
         anyhow::ensure!(
-            m.is_finite() && m > 0.0,
-            "run_rg_ldsc: each M value must be finite and > 0"
+            m.is_finite() && m != 0.0,
+            "run_rg_ldsc: each M value must be finite and non-zero"
         );
     }
     anyhow::ensure!(n_blocks > 1, "run_rg_ldsc: n_blocks must be > 1");
@@ -3802,4 +3802,154 @@ fn liability_conversion_factor(samp_prev: f64, pop_prev: f64) -> f64 {
     let k = pop_prev;
     let p = samp_prev;
     k * k * (1.0 - k) * (1.0 - k) / (p * (1.0 - p) * z * z)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Rust-side analogue of `synthetic_partitioned_h2_columns` in
+    /// `python/tests/test_api.py`, parameterized on `m1`/`m2` so tests can
+    /// exercise a negative M value the way baselineLD_v2.2's
+    /// `MAF_Adj_Predicted_Allele_Age`/`MAF_Adj_ASMC` categories are.
+    fn synthetic_partitioned_h2_columns(
+        n: usize,
+        h2_1: f64,
+        h2_2: f64,
+        m1: f64,
+        m2: f64,
+    ) -> (ColF, Vec<ColF>, ColF, ColF) {
+        let ref_ld1: Vec<f64> = (0..n).map(|i| 1.0 + 0.02 * i as f64).collect();
+        let ref_ld2: Vec<f64> = (0..n).map(|i| 1.0 + 0.03 * ((i * 7) % 13) as f64).collect();
+        let sample_size = vec![10_000.0; n];
+        let chi2: Vec<f64> = (0..n)
+            .map(|i| 1.0 + sample_size[i] * (h2_1 * ref_ld1[i] / m1 + h2_2 * ref_ld2[i] / m2))
+            .collect();
+        let weight_ld: Vec<f64> = (0..n).map(|i| (ref_ld1[i] + ref_ld2[i]).max(1.0)).collect();
+        (
+            col_from_vec(chi2),
+            vec![col_from_vec(ref_ld1), col_from_vec(ref_ld2)],
+            col_from_vec(weight_ld),
+            col_from_vec(sample_size),
+        )
+    }
+
+    #[test]
+    fn run_h2_ldsc_partitioned_accepts_negative_finite_m() {
+        let n = 100;
+        // Legitimate negative M, e.g. a mean-centered continuous
+        // baselineLD_v2.2 annotation (MAF_Adj_Predicted_Allele_Age /
+        // MAF_Adj_ASMC), whose genome-wide-summed M can be negative.
+        let m1 = -100.0;
+        let m2 = 500.0;
+        let (chi2, ref_l2_k, w_l2, n_vec) = synthetic_partitioned_h2_columns(n, 0.15, 0.10, m1, m2);
+
+        let result =
+            run_h2_ldsc_partitioned(&chi2, &ref_l2_k, &w_l2, &n_vec, &[m1, m2], 10, Some(1.0))
+                .expect("negative-but-finite-nonzero M must be accepted");
+
+        assert!(result.h2_total.is_finite());
+        for &h in &result.h2_per_annot {
+            assert!(h.is_finite());
+        }
+        for &se in &result.h2_per_annot_se {
+            assert!(se.is_finite());
+        }
+    }
+
+    #[test]
+    fn run_h2_ldsc_partitioned_rejects_zero_m() {
+        let n = 100;
+        let (chi2, ref_l2_k, w_l2, n_vec) =
+            synthetic_partitioned_h2_columns(n, 0.15, 0.10, 500.0, 500.0);
+
+        let err = run_h2_ldsc_partitioned(
+            &chi2,
+            &ref_l2_k,
+            &w_l2,
+            &n_vec,
+            &[0.0, 500.0],
+            10,
+            Some(1.0),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("finite and non-zero"));
+    }
+
+    #[test]
+    fn run_h2_ldsc_partitioned_rejects_nonfinite_m() {
+        let n = 100;
+        let (chi2, ref_l2_k, w_l2, n_vec) =
+            synthetic_partitioned_h2_columns(n, 0.15, 0.10, 500.0, 500.0);
+
+        for bad_m in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let err = run_h2_ldsc_partitioned(
+                &chi2,
+                &ref_l2_k,
+                &w_l2,
+                &n_vec,
+                &[bad_m, 500.0],
+                10,
+                Some(1.0),
+            )
+            .unwrap_err();
+            assert!(err.to_string().contains("finite and non-zero"));
+        }
+    }
+
+    /// End-to-end through the actual `--overlap-annot` math
+    /// (`compute_overlap_enrichment`), not just the public wrapper —
+    /// exercises the unguarded `overlap_prop`/`term1` divisions with a real
+    /// negative M. A diagonal overlap matrix (disjoint categories) makes the
+    /// overlap-corrected enrichment reduce exactly to the naive
+    /// prop_h2/prop_m formula, so we can assert an exact value rather than
+    /// just "doesn't panic".
+    #[test]
+    fn overlap_enrichment_finite_with_negative_category_m() {
+        let n = 100;
+        let m1 = -100.0;
+        let m2 = 500.0;
+        let (chi2, ref_l2_k, w_l2, n_vec) = synthetic_partitioned_h2_columns(n, 0.15, 0.10, m1, m2);
+
+        let fit = partitioned_h2_core_validated(
+            &chi2,
+            &ref_l2_k,
+            &w_l2,
+            &n_vec,
+            &[m1, m2],
+            10,
+            Some(1.0),
+        )
+        .expect("negative-but-finite-nonzero M must be accepted");
+
+        let mut overlap = mat_zeros(2, 2);
+        overlap[(0, 0)] = m1;
+        overlap[(1, 1)] = m2;
+        let m_tot = 1000usize;
+
+        let names = vec!["CatA".to_string(), "CatB".to_string()];
+        let enrichment = compute_overlap_enrichment(&fit, &names, &overlap, m_tot)
+            .expect("overlap enrichment must succeed with a negative-M category");
+
+        for &v in &enrichment.prop_m_overlap {
+            assert!(v.is_finite());
+        }
+        for &v in &enrichment.prop_h2_overlap {
+            assert!(v.is_finite());
+        }
+        for &v in &enrichment.enrichment {
+            assert!(v.is_finite());
+        }
+
+        // Disjoint-category invariant (matches the naive, non-overlap
+        // formula exactly): enrichment[i] == (h2_per_annot[i]/h2_total) /
+        // (m_vec[i]/m_tot).
+        let m_tot_f = m_tot as f64;
+        for i in 0..2 {
+            let naive_prop_h2 = fit.h2_per_annot[i] / fit.h2_total;
+            let naive_prop_m = fit.m_vec[i] / m_tot_f;
+            let expected = naive_prop_h2 / naive_prop_m;
+            assert!((enrichment.enrichment[i] - expected).abs() < 1e-6);
+        }
+    }
 }

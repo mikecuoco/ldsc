@@ -29,13 +29,18 @@ def synthetic_h2_columns(n: int = 100, h2: float = 0.25):
     return chi2, ref_ld, weight_ld, sample_size, m_snps
 
 
-def synthetic_partitioned_h2_columns(n: int = 100, h2_1: float = 0.15, h2_2: float = 0.10):
+def synthetic_partitioned_h2_columns(
+    n: int = 100,
+    h2_1: float = 0.15,
+    h2_2: float = 0.10,
+    m1: float = 500.0,
+    m2: float = 500.0,
+):
     # ref_ld1 (linear in i) and ref_ld2 (an unrelated modular pattern) are
     # deliberately non-collinear so the K=2 design matrix is well-conditioned.
     ref_ld1 = [1.0 + 0.02 * i for i in range(n)]
     ref_ld2 = [1.0 + 0.03 * ((i * 7) % 13) for i in range(n)]
     sample_size = [10_000.0] * n
-    m1, m2 = 500.0, 500.0
     chi2 = [
         1.0
         + sample_size[i] * (h2_1 * ref_ld1[i] / m1 + h2_2 * ref_ld2[i] / m2)
@@ -419,6 +424,40 @@ def test_fit_h2_partitioned_accepts_numpy_2d_ref_ld():
     )
 
 
+def test_fit_h2_partitioned_accepts_negative_m():
+    # baselineLD_v2.2's MAF_Adj_Predicted_Allele_Age / MAF_Adj_ASMC
+    # categories are mean-centered continuous annotations whose
+    # genome-wide-summed M is legitimately negative (e.g. -268.70). This
+    # must not be rejected.
+    chi2, ref_ld, weight_ld, sample_size, m_vec = synthetic_partitioned_h2_columns(
+        m1=-100.0, m2=500.0
+    )
+    result = fit_h2_partitioned(
+        chi2, ref_ld, weight_ld, sample_size, m_vec=m_vec, n_blocks=10, intercept=1.0
+    )
+    assert isfinite(result.heritability.value)
+    for est in result.per_annotation:
+        assert isfinite(est.value)
+    assert result.m_values == tuple(m_vec)
+
+
+def test_fit_h2_partitioned_rejects_zero_m():
+    chi2, ref_ld, weight_ld, sample_size, _m_vec = synthetic_partitioned_h2_columns()
+    with pytest.raises(ValueError, match="finite and non-zero"):
+        fit_h2_partitioned(
+            chi2, ref_ld, weight_ld, sample_size, m_vec=[0.0, 500.0], n_blocks=10
+        )
+
+
+def test_fit_h2_partitioned_rejects_nonfinite_m():
+    chi2, ref_ld, weight_ld, sample_size, _m_vec = synthetic_partitioned_h2_columns()
+    for bad_m in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(ValueError, match="finite and non-zero"):
+            fit_h2_partitioned(
+                chi2, ref_ld, weight_ld, sample_size, m_vec=[bad_m, 500.0], n_blocks=10
+            )
+
+
 def test_fit_rg_partitioned_identical_traits_is_one():
     chi2, ref_ld, weight_ld, sample_size, m_vec = synthetic_partitioned_h2_columns()
     z = [sqrt(value) for value in chi2]
@@ -623,6 +662,141 @@ def test_estimate_h2_overlap_annot_disjoint_categories_matches_naive(tmp_path):
         assert cat.prop_snps == pytest.approx(naive_prop_m, abs=1e-9)
         assert cat.prop_h2.value == pytest.approx(naive_prop_h2, abs=1e-6)
         assert cat.enrichment.value == pytest.approx(naive_prop_h2 / naive_prop_m, abs=1e-6)
+
+
+def test_estimate_h2_overlap_annot_accepts_negative_m_snps(tmp_path):
+    # Reproduces the baselineLD_v2.2 bug report shape: estimate_h2(...,
+    # overlap_annot=True) must not hard-reject a negative M. Passing a
+    # negative m_snps override drives resolve_m_vec's uniform fallback
+    # (total / k) negative for every category, exercising the same
+    # validation and overlap-enrichment code the real bug hit, without
+    # needing to fabricate chromosome-split `.l2.M` files.
+    n = 100
+    chi2, ref_ld, weight_ld, sample_size, _m_vec = synthetic_partitioned_h2_columns(n=n)
+    snps = [f"rs{i}" for i in range(n)]
+    z = [sqrt(v) for v in chi2]
+
+    sumstats_path = tmp_path / "trait.sumstats"
+    _write_lines(
+        sumstats_path,
+        ["SNP\tN\tZ"] + [f"{s}\t{nn}\t{zv}" for s, nn, zv in zip(snps, sample_size, z)],
+    )
+    ref_ld_path = tmp_path / "trait.l2.ldscore"
+    _write_lines(
+        ref_ld_path,
+        ["SNP\tL2A\tL2B"] + [f"{s}\t{a}\t{b}" for s, (a, b) in zip(snps, ref_ld)],
+    )
+    w_ld_path = tmp_path / "trait.w_ld.ldscore"
+    _write_lines(
+        w_ld_path,
+        ["SNP\tL2"] + [f"{s}\t{v}" for s, v in zip(snps, weight_ld)],
+    )
+    annot_path = tmp_path / "trait.l2.ldscore.annot"
+    annot_lines = ["CHR\tSNP\tBP\tCM\tCatA\tCatB"]
+    for i, s in enumerate(snps):
+        in_a = 1 if i < n // 2 else 0
+        annot_lines.append(f"1\t{s}\t{i}\t0\t{in_a}\t{1 - in_a}")
+    _write_lines(annot_path, annot_lines)
+
+    result = estimate_h2(
+        str(sumstats_path),
+        ref_ld=str(ref_ld_path),
+        w_ld=str(w_ld_path),
+        n_blocks=10,
+        not_m_5_50=True,
+        overlap_annot=True,
+        m_snps=-1000.0,
+    )
+
+    assert result.overlap_enrichment is not None
+    assert all(m < 0 for m in result.m_values)
+    for cat in result.overlap_enrichment:
+        assert isfinite(cat.prop_snps)
+        assert isfinite(cat.prop_h2.value)
+        assert isfinite(cat.enrichment.value)
+
+
+def test_estimate_h2_overlap_annot_rejects_zero_m_snps(tmp_path):
+    n = 100
+    chi2, ref_ld, weight_ld, sample_size, _m_vec = synthetic_partitioned_h2_columns(n=n)
+    snps = [f"rs{i}" for i in range(n)]
+    z = [sqrt(v) for v in chi2]
+
+    sumstats_path = tmp_path / "trait.sumstats"
+    _write_lines(
+        sumstats_path,
+        ["SNP\tN\tZ"] + [f"{s}\t{nn}\t{zv}" for s, nn, zv in zip(snps, sample_size, z)],
+    )
+    ref_ld_path = tmp_path / "trait.l2.ldscore"
+    _write_lines(
+        ref_ld_path,
+        ["SNP\tL2A\tL2B"] + [f"{s}\t{a}\t{b}" for s, (a, b) in zip(snps, ref_ld)],
+    )
+    w_ld_path = tmp_path / "trait.w_ld.ldscore"
+    _write_lines(
+        w_ld_path,
+        ["SNP\tL2"] + [f"{s}\t{v}" for s, v in zip(snps, weight_ld)],
+    )
+    annot_path = tmp_path / "trait.l2.ldscore.annot"
+    annot_lines = ["CHR\tSNP\tBP\tCM\tCatA\tCatB"]
+    for i, s in enumerate(snps):
+        in_a = 1 if i < n // 2 else 0
+        annot_lines.append(f"1\t{s}\t{i}\t0\t{in_a}\t{1 - in_a}")
+    _write_lines(annot_path, annot_lines)
+
+    with pytest.raises(ValueError, match="finite and non-zero"):
+        estimate_h2(
+            str(sumstats_path),
+            ref_ld=str(ref_ld_path),
+            w_ld=str(w_ld_path),
+            n_blocks=10,
+            not_m_5_50=True,
+            overlap_annot=True,
+            m_snps=0.0,
+        )
+
+
+def test_estimate_h2_partitioned_accepts_negative_m_snps_without_overlap_annot(tmp_path):
+    # The bug report's scope turned out broader than overlap-annot: any K>1
+    # `estimate_h2` call goes through the same `partitioned_h2_core_validated`
+    # chokepoint (src/regressions.rs, called unconditionally before the
+    # `overlap_annot` branch), so a negative M must not be rejected here
+    # either, even with no `.annot` file and `overlap_annot=False`.
+    n = 100
+    chi2, ref_ld, weight_ld, sample_size, _m_vec = synthetic_partitioned_h2_columns(n=n)
+    snps = [f"rs{i}" for i in range(n)]
+    z = [sqrt(v) for v in chi2]
+
+    sumstats_path = tmp_path / "trait.sumstats"
+    _write_lines(
+        sumstats_path,
+        ["SNP\tN\tZ"] + [f"{s}\t{nn}\t{zv}" for s, nn, zv in zip(snps, sample_size, z)],
+    )
+    ref_ld_path = tmp_path / "trait.l2.ldscore"
+    _write_lines(
+        ref_ld_path,
+        ["SNP\tL2A\tL2B"] + [f"{s}\t{a}\t{b}" for s, (a, b) in zip(snps, ref_ld)],
+    )
+    w_ld_path = tmp_path / "trait.w_ld.ldscore"
+    _write_lines(
+        w_ld_path,
+        ["SNP\tL2"] + [f"{s}\t{v}" for s, v in zip(snps, weight_ld)],
+    )
+
+    result = estimate_h2(
+        str(sumstats_path),
+        ref_ld=str(ref_ld_path),
+        w_ld=str(w_ld_path),
+        n_blocks=10,
+        overlap_annot=False,
+        m_snps=-1000.0,
+    )
+
+    assert result.overlap_enrichment is None
+    assert all(m < 0 for m in result.m_values)
+    assert isfinite(result.heritability.value)
+    for est in result.per_annotation:
+        assert isfinite(est.value)
 
 
 def test_estimate_h2_overlap_annot_out_writes_cli_compatible_results_file(tmp_path):
